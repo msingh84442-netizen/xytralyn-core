@@ -12,6 +12,31 @@ from app.services.notifier import send_admin_alert
 
 router = APIRouter(prefix="/chat", tags=["Chat"])
 
+def build_chat_history(db: Session, sender_phone: str, limit: int = 6):
+    """Database se recent messages nikal kar Groq messages format mein convert karta hai."""
+    history = []
+    try:
+        # Recent messages descending order mein fetch karein
+        records = (
+            db.query(Message)
+            .filter(Message.sender_phone == sender_phone)
+            .order_by(Message.id.desc())
+            .limit(limit)
+            .all()
+        )
+        # Chronological order ke liye reverse karein
+        records.reverse()
+
+        for rec in records:
+            if rec.content:
+                history.append({"role": "user", "content": rec.content})
+            if hasattr(rec, "agent_reply") and rec.agent_reply:
+                history.append({"role": "assistant", "content": rec.agent_reply})
+    except Exception as err:
+        print(f"[HISTORY FETCH ERROR]: {err}")
+    return history
+
+
 # 1. Verification GET route
 @router.get("/incoming")
 async def incoming_chat_get():
@@ -30,11 +55,10 @@ async def incoming_chat(
 
     print(f"\033[96m[DEBUG USER MSG]:\033[0m {user_message} (From: {sender_phone})")
 
-    # AI + Fallback Regex Extractor ko call karein
+    # Lead extraction
     extracted = extract_lead_info(user_message)
     print(f"\033[94m[DEBUG EXTRACTED]:\033[0m {extracted}")
 
-    # Lead check ya create
     target_lead = db.query(Lead).filter(Lead.phone == sender_phone).first()
     if not target_lead:
         target_lead = Lead(
@@ -47,7 +71,6 @@ async def incoming_chat(
         db.commit()
         db.refresh(target_lead)
     else:
-        # Agar pehle se lead hai toh details update karein
         if extracted.get("name") and extracted.get("name") != "Lead Customer":
             target_lead.name = extracted.get("name")
         if extracted.get("company") and extracted.get("company") != "N/A":
@@ -55,17 +78,11 @@ async def incoming_chat(
         db.commit()
         db.refresh(target_lead)
 
-    # Phone number extraction check (agar message body mein alag number ho)
     phone_pattern = r'(?:(?:\+91|0)?[ -]?)?([6-9]\d{9})\b'
     phone_match = re.search(phone_pattern, user_message)
     final_contact_phone = phone_match.group(1).strip() if phone_match else target_lead.phone
 
-    print(
-        f"\033[92m[LEAD COMMITTED]: Phone={final_contact_phone} | "
-        f"Company={target_lead.company} | Name={getattr(target_lead, 'name', '')}\033[0m"
-    )
-
-    # Admin WhatsApp Alert Send Karein
+    # Admin alert
     try:
         send_admin_alert(
             lead_name=getattr(target_lead, "name", "Lead Customer"),
@@ -75,15 +92,18 @@ async def incoming_chat(
     except Exception as alert_err:
         print(f"\033[91m[ALERT WARNING]: Failed to notify admin: {alert_err}\033[0m")
 
-    # Auto-Reply via Groq AI Agent
+    # Database se chat history nikaalein
+    chat_history = build_chat_history(db, sender_phone, limit=6)
+
+    # Auto-Reply with memory context
     try:
-        ai_response = generate_agent_reply(user_message)
+        ai_response = generate_agent_reply(user_message, history=chat_history)
     except Exception as agent_err:
         print(f"[AI AGENT ERROR]: {agent_err}")
         company_name = target_lead.company if target_lead.company and target_lead.company != "N/A" else "Customer"
         ai_response = f"Dhanyavaad, {company_name}! Aapki details note kar li gayi hain. Hamari team aapko jald hi contact karegi."
 
-    # Message History Save Karein
+    # Message Save Karein
     msg_record = Message(
         sender_phone=sender_phone,
         content=user_message,
@@ -111,15 +131,13 @@ async def green_api_webhook(request: Request, db: Session = Depends(get_db)):
 
     type_webhook = data.get("typeWebhook")
 
-    # Sirf incoming customer text messages handle karein
     if type_webhook != "incomingMessageReceived":
         return {"status": "ignored", "type": type_webhook}
 
     message_data = data.get("messageData", {})
     sender_data = data.get("senderData", {})
 
-    # Extract phone and text
-    raw_sender = sender_data.get("sender", "")  # e.g., "91XXXXXXXXXX@c.us"
+    raw_sender = sender_data.get("sender", "")
     sender_phone = raw_sender.replace("@c.us", "").strip()
 
     type_msg = message_data.get("typeMessage")
@@ -132,10 +150,8 @@ async def green_api_webhook(request: Request, db: Session = Depends(get_db)):
     if not user_message or not sender_phone:
         return {"status": "no_message_or_phone"}
 
-    # 1. Lead extraction via AI / Regex
     extracted = extract_lead_info(user_message)
 
-    # 2. Database update or create
     target_lead = db.query(Lead).filter(Lead.phone == sender_phone).first()
     if not target_lead:
         target_lead = Lead(
@@ -155,7 +171,6 @@ async def green_api_webhook(request: Request, db: Session = Depends(get_db)):
         db.commit()
         db.refresh(target_lead)
 
-    # 3. Admin Notification Alert
     try:
         send_admin_alert(
             lead_name=getattr(target_lead, "name", "Lead Customer"),
@@ -165,15 +180,18 @@ async def green_api_webhook(request: Request, db: Session = Depends(get_db)):
     except Exception as alert_err:
         print(f"[ALERT WARNING]: Failed to notify admin: {alert_err}")
 
-    # 4. Generate Dynamic AI Reply via Groq Agent
+    # History fetch karein
+    chat_history = build_chat_history(db, sender_phone, limit=6)
+
+    # Generate reply with context
     try:
-        ai_response = generate_agent_reply(user_message)
+        ai_response = generate_agent_reply(user_message, history=chat_history)
     except Exception as agent_err:
         print(f"[AI AGENT ERROR]: {agent_err}")
         company_name = target_lead.company if target_lead.company and target_lead.company != "N/A" else "Customer"
         ai_response = f"Dhanyavaad, {company_name}! Aapki details note kar li gayi hain. Hamari team aapko jald hi contact karegi."
 
-    # 5. Save conversation history
+    # Save to DB
     msg_record = Message(
         sender_phone=sender_phone,
         content=user_message,
@@ -184,7 +202,7 @@ async def green_api_webhook(request: Request, db: Session = Depends(get_db)):
     db.add(msg_record)
     db.commit()
 
-    # 6. Dispatch reply via Green-API
+    # Green-API Dispatch
     instance_id = os.getenv("GREEN_API_INSTANCE_ID")
     token = os.getenv("GREEN_API_TOKEN")
 
