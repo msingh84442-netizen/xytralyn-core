@@ -1,8 +1,8 @@
 import os
+import re
 from groq import Groq
 
 def get_groq_client():
-    # Environment variable ka exact naam yahan aayega
     api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
         return None
@@ -32,7 +32,6 @@ def generate_agent_reply(user_message: str) -> str:
         return completion.choices[0].message.content.strip()
     except Exception as e:
         print(f"[GROQ ERROR]: {e}")
-        # Secondary fallback model
         try:
             fallback_res = client.chat.completions.create(
                 model="llama-3.1-8b-instant",
@@ -47,3 +46,17 @@ def generate_agent_reply(user_message: str) -> str:
         except Exception as fb_e:
             print(f"[GROQ FALLBACK ERROR]: {fb_e}")
             return "Thanks for reaching out! Our team will contact you shortly."
+
+def extract_lead_info(user_message: str) -> dict:
+    # Basic lead extractor for name, phone, email
+    lead_data = {"name": None, "phone": None, "email": None}
+    
+    email_match = re.search(r'[\w\.-]+@[\w\.-]+\.\w+', user_message)
+    if email_match:
+        lead_data["email"] = email_match.group(0)
+
+    phone_match = re.search(r'(\+?\d{10,13})', user_message)
+    if phone_match:
+        lead_data["phone"] = phone_match.group(0)
+
+    return lead_data
