@@ -8,22 +8,18 @@ from dotenv import load_dotenv
 load_dotenv()
 
 SYSTEM_PROMPT = """
-You are Xytralyn AI Sales & Assistance Agent for a Multi-Agent AI SaaS & Automation platform.
+You are Xytralyn AI Assistant chatting on WhatsApp.
 
 About Xytralyn:
-We build and deploy specialized autonomous AI agents and WhatsApp automation for businesses:
-1. Sales Agent: 24/7 lead qualification, booking demos, customer questions
-2. Support Agent: FAQ answering, issue logging, ticket creation
-3. HR Agent: Automated screening, interview questions, internal queries
-4. Accountant Agent: Invoice processing, GST calculations, expense tracking
-5. Research Agent: Market analysis, competitor research, content generation
+We provide Multi-Agent AI SaaS & business automation (Sales, Support, HR, Accountant, Research agents) and WhatsApp automation.
 
-Strict Memory & Context Rules:
-- If the customer has ALREADY provided their name, phone number, or email in previous messages, NEVER ask for them again. Acknowledge and confirm their details.
-- Reply in clear, polite, and natural Hinglish (Hindi + English).
-- Strictly keep responses within 2-3 short sentences.
-- When scheduling a demo, confirm the time directly (e.g., "Demo booked for tomorrow at 3:00 PM. We will send the Google Meet link to your shared email.")
-- Never make up fake prices, features, or guarantees.
+Strict WhatsApp Chat Guidelines:
+- Reply in short, natural, friendly Hinglish (Hindi + English).
+- Limit your response to 1-2 complete sentences.
+- Never write formal email signatures, closings, or sign-offs (strictly NO "Regards", "Sincerely", "Xytralyn AI Assistant").
+- If the customer asks about their demo timing and 3:00 PM was previously discussed or booked, directly confirm: "Aapka demo kal dopahar 3:00 PM par Google Meet par scheduled hai."
+- If the customer has already provided their name, phone number, or email in previous messages, do NOT ask for them again.
+- Always finish your thoughts completely—never leave sentences half-written.
 """
 
 def get_groq_client() -> Optional[Groq]:
@@ -62,12 +58,12 @@ def generate_agent_reply(user_message: str, history: Optional[List[Dict[str, str
     if client is None:
         return "Dhanyavaad! 🙏 Hamari team aapki query check karke aapse jaldi contact karegi."
 
-    # Messages array with System Prompt
+    # Messages payload with system instructions
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
-    # Agar previous conversation history provide ki gayi ho, toh use context mein add karein
+    # Pichle conversation context ko append karein
     if history and isinstance(history, list):
-        for msg in history[-6:]:  # Last 6 messages for context
+        for msg in history[-8:]:  # Last 8 messages for full context
             messages.append(msg)
 
     # Current user message
@@ -77,17 +73,17 @@ def generate_agent_reply(user_message: str, history: Optional[List[Dict[str, str
 
     for model_id in available_models:
         try:
-            print(f"[GROQ ATTEMPT]: Trying model {model_id}")
             completion = client.chat.completions.create(
                 model=model_id,
                 messages=messages,
-                temperature=0.5,
-                max_tokens=220
+                temperature=0.3,
+                max_tokens=250
             )
             reply = completion.choices[0].message.content
             if reply and reply.strip():
-                print(f"[GROQ SUCCESS]: Reply generated using {model_id}")
-                return reply.strip()
+                # Cleanup if model outputs email closings by accident
+                cleaned_reply = re.sub(r'(?i)\n*(regards|sincerely|best regards|xytralyn ai assistant).*', '', reply.strip()).strip()
+                return cleaned_reply if cleaned_reply else reply.strip()
         except Exception as e:
             print(f"[GROQ MODEL FAILED] Model={model_id} | Error={e}")
             continue
