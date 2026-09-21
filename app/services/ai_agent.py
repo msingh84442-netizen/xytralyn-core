@@ -18,11 +18,11 @@ We build and deploy specialized autonomous AI agents and WhatsApp automation for
 4. Accountant Agent: Invoice processing, GST calculations, expense tracking
 5. Research Agent: Market analysis, competitor research, content generation
 
-Your Guidelines:
+Strict Memory & Context Rules:
+- If the customer has ALREADY provided their name, phone number, or email in previous messages, NEVER ask for them again. Acknowledge and confirm their details.
 - Reply in clear, polite, and natural Hinglish (Hindi + English).
 - Strictly keep responses within 2-3 short sentences.
-- Explain how Xytralyn helps automate business operations and WhatsApp workflows.
-- Encourage interested customers to share requirements or book a demo.
+- When scheduling a demo, confirm the time directly (e.g., "Demo booked for tomorrow at 3:00 PM. We will send the Google Meet link to your shared email.")
 - Never make up fake prices, features, or guarantees.
 """
 
@@ -43,27 +43,35 @@ def get_available_chat_models(client: Groq) -> List[str]:
         models_data = client.models.list()
         active_ids = [m.id for m in models_data.data if getattr(m, 'active', True)]
         
-        # Non-chat, guardrail aur voice models ko ignore karein
         ignore_keywords = ["whisper", "vision", "guard", "arabic", "canopylabs", "compound"]
         chat_models = [m for m in active_ids if not any(k in m.lower() for k in ignore_keywords)]
         
-        # Verified working models ko pehle rank karein
         preferred_order = ["openai/gpt-oss-20b", "openai/gpt-oss-120b", "qwen/qwen3.8-27b"]
         sorted_models = [m for m in preferred_order if m in chat_models] + [m for m in chat_models if m not in preferred_order]
         
-        print(f"[GROQ PRIORITIZED MODELS]: {sorted_models}")
         return sorted_models if sorted_models else ["openai/gpt-oss-20b"]
     except Exception as e:
         print(f"[GROQ LIST MODELS ERROR]: {e}")
         return ["openai/gpt-oss-20b"]
 
-def generate_agent_reply(user_message: str) -> str:
+def generate_agent_reply(user_message: str, history: Optional[List[Dict[str, str]]] = None) -> str:
     if not user_message or not user_message.strip():
         return "Namaste! 👋 Main Xytralyn AI assistant hoon. Aapko kis service ya agent ke baare mein janna hai?"
 
     client = get_groq_client()
     if client is None:
         return "Dhanyavaad! 🙏 Hamari team aapki query check karke aapse jaldi contact karegi."
+
+    # Messages array with System Prompt
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+    # Agar previous conversation history provide ki gayi ho, toh use context mein add karein
+    if history and isinstance(history, list):
+        for msg in history[-6:]:  # Last 6 messages for context
+            messages.append(msg)
+
+    # Current user message
+    messages.append({"role": "user", "content": user_message.strip()})
 
     available_models = get_available_chat_models(client)
 
@@ -72,11 +80,8 @@ def generate_agent_reply(user_message: str) -> str:
             print(f"[GROQ ATTEMPT]: Trying model {model_id}")
             completion = client.chat.completions.create(
                 model=model_id,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": user_message.strip()}
-                ],
-                temperature=0.6,
+                messages=messages,
+                temperature=0.5,
                 max_tokens=220
             )
             reply = completion.choices[0].message.content
