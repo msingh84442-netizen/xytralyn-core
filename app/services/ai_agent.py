@@ -2,7 +2,7 @@ import os
 import re
 from typing import Optional, Dict, List
 
-from groq import Groq
+from groq import AsyncGroq
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -11,32 +11,32 @@ SYSTEM_PROMPT = """
 You are Xytralyn AI Assistant chatting on WhatsApp.
 
 About Xytralyn:
-We provide Multi-Agent AI SaaS & business automation (Sales, Support, HR, Accountant, Research agents) and WhatsApp automation.
+We provide Multi-Agent AI SaaS & business automation (Sales, Support, HR, Accountant, Research agents) and WhatsApp automation for businesses.
 
-Strict WhatsApp Chat Guidelines:
+Strict WhatsApp Guidelines:
 - Reply in short, natural, friendly Hinglish (Hindi + English).
-- Limit your response to 1-2 complete sentences.
-- Never write formal email signatures, closings, or sign-offs (strictly NO "Regards", "Sincerely", "Xytralyn AI Assistant").
-- If the customer asks about their demo timing and 3:00 PM was previously discussed or booked, directly confirm: "Aapka demo kal dopahar 3:00 PM par Google Meet par scheduled hai."
-- If the customer has already provided their name, phone number, or email in previous messages, do NOT ask for them again.
-- Always finish your thoughts completely—never leave sentences half-written.
+- Limit responses strictly to 1-2 concise sentences. Keep it conversational like real WhatsApp chat.
+- NEVER include formal email signatures, closings, or sign-offs (strictly NO "Regards", "Sincerely", "Xytralyn AI Assistant").
+- CONTEXT AWARENESS: Answer specifically based on what THIS customer is asking. If they want info, explain briefly. If they ask for pricing, mention custom plans based on their scale.
+- DEMO SCHEDULING: If they mention a specific day/time, confirm THAT specific time. Do NOT assume 3:00 PM unless they explicitly said 3:00 PM. If no time is shared, ask for their convenient slot.
+- LEAD DETAILS: If the user has already shared their name, phone, or email in previous messages, NEVER ask for them again.
 """
 
-def get_groq_client() -> Optional[Groq]:
+def get_async_groq_client() -> Optional[AsyncGroq]:
     api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
         print("[GROQ ERROR]: GROQ_API_KEY environment variable is missing!")
         return None
     try:
-        return Groq(api_key=api_key.strip())
+        return AsyncGroq(api_key=api_key.strip())
     except Exception as e:
         print(f"[GROQ CLIENT ERROR]: {e}")
         return None
 
-def get_available_chat_models(client: Groq) -> List[str]:
-    """Dynamically fetch and prioritize active general chat models."""
+async def get_available_chat_models(client: AsyncGroq) -> List[str]:
+    """Dynamically fetch and prioritize active general chat models asynchronously."""
     try:
-        models_data = client.models.list()
+        models_data = await client.models.list()
         active_ids = [m.id for m in models_data.data if getattr(m, 'active', True)]
         
         ignore_keywords = ["whisper", "vision", "guard", "arabic", "canopylabs", "compound"]
@@ -50,45 +50,42 @@ def get_available_chat_models(client: Groq) -> List[str]:
         print(f"[GROQ LIST MODELS ERROR]: {e}")
         return ["openai/gpt-oss-20b"]
 
-def generate_agent_reply(user_message: str, history: Optional[List[Dict[str, str]]] = None) -> str:
+async def generate_agent_reply(user_message: str, history: Optional[List[Dict[str, str]]] = None) -> str:
     if not user_message or not user_message.strip():
-        return "Namaste! 👋 Main Xytralyn AI assistant hoon. Aapko kis service ya agent ke baare mein janna hai?"
+        return "Namaste! 👋 Main Xytralyn AI assistant hoon. Aapki kya sahayata kar sakta hoon?"
 
-    client = get_groq_client()
+    client = get_async_groq_client()
     if client is None:
         return "Dhanyavaad! 🙏 Hamari team aapki query check karke aapse jaldi contact karegi."
 
-    # Messages payload with system instructions
+    # Messages array with isolated context
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
-    # Pichle conversation context ko append karein
     if history and isinstance(history, list):
-        for msg in history[-8:]:  # Last 8 messages for full context
+        for msg in history[-8:]:  # Last 8 messages for isolated session memory
             messages.append(msg)
 
-    # Current user message
     messages.append({"role": "user", "content": user_message.strip()})
 
-    available_models = get_available_chat_models(client)
+    available_models = await get_available_chat_models(client)
 
     for model_id in available_models:
         try:
-            completion = client.chat.completions.create(
+            completion = await client.chat.completions.create(
                 model=model_id,
                 messages=messages,
                 temperature=0.3,
-                max_tokens=250
+                max_tokens=220
             )
             reply = completion.choices[0].message.content
             if reply and reply.strip():
-                # Cleanup if model outputs email closings by accident
                 cleaned_reply = re.sub(r'(?i)\n*(regards|sincerely|best regards|xytralyn ai assistant).*', '', reply.strip()).strip()
                 return cleaned_reply if cleaned_reply else reply.strip()
         except Exception as e:
-            print(f"[GROQ MODEL FAILED] Model={model_id} | Error={e}")
+            print(f"[GROQ ASYNC MODEL FAILED] Model={model_id} | Error={e}")
             continue
 
-    return "Thanks for reaching out! 🙏 Hamari team aapki query check karke aapse shortly contact karegi."
+    return "Thanks for reaching out! 🙏 Hamari team aapki query check karke aapse shortly connect karegi."
 
 def extract_lead_info(user_message: str) -> Dict[str, Optional[str]]:
     lead_data = {"name": None, "phone": None, "email": None}
