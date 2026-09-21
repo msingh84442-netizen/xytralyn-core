@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI WhatsApp Lead Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-900 text-slate-100 min-h-screen p-8">
+    <div class="max-w-6xl mx-auto">
+        <div class="flex justify-between items-center mb-8 border-b border-slate-700 pb-4">
+            <div>
+                <h1 class="text-3xl font-bold text-emerald-400">WhatsApp Lead CRM</h1>
+                <p class="text-slate-400 text-sm mt-1">Live Captured Inbound Leads & Pipeline Management</p>
+            </div>
+            <a href="/leads" class="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 rounded-lg text-sm font-semibold transition">
+                Refresh Leads
+            </a>
+        </div>
+
+        <div class="overflow-x-auto bg-slate-800 rounded-xl shadow-xl border border-slate-700">
+            <table class="w-full text-left border-collapse">
+                <thead>
+                    <tr class="bg-slate-950 text-slate-300 text-sm uppercase tracking-wider">
+                        <th class="py-4 px-6">ID</th>
+                        <th class="py-4 px-6">Name</th>
+                        <th class="py-4 px-6">Company</th>
+                        <th class="py-4 px-6">Phone Number</th>
+                        <th class="py-4 px-6">Pipeline Status</th>
+                    </tr>
+                </thead>
+                <tbody class="divide-y divide-slate-700 text-sm">
+                    {% for lead in leads %}
+                    <tr class="hover:bg-slate-750 transition" id="row-{{ lead.id }}">
+                        <td class="py-4 px-6 font-mono text-slate-400">#{{ (lead.id|string)[:8] }}</td>
+                        <td class="py-4 px-6 font-semibold text-white">{{ lead.name or "N/A" }}</td>
+                        <td class="py-4 px-6 text-emerald-300">{{ lead.company or "N/A" }}</td>
+                        <td class="py-4 px-6 font-mono text-slate-300">{{ lead.phone }}</td>
+                        <td class="py-4 px-6">
+                            <select 
+                                onchange="updateLeadStatus('{{ lead.id }}', this.value)"
+                                class="bg-slate-900 border border-slate-700 text-xs font-semibold rounded-lg px-3 py-1.5 text-emerald-400 focus:outline-none focus:border-emerald-500 cursor-pointer">
+                                <option value="new" {% if lead.status == 'new' or lead.status == 'active' %}selected{% endif %}>New</option>
+                                <option value="contacted" {% if lead.status == 'contacted' %}selected{% endif %}>Contacted</option>
+                                <option value="demo" {% if lead.status == 'demo' %}selected{% endif %}>Demo Scheduled</option>
+                                <option value="converted" {% if lead.status == 'converted' %}selected{% endif %}>Converted</option>
+                                <option value="lost" {% if lead.status == 'lost' %}selected{% endif %}>Lost</option>
+                            </select>
+                        </td>
+                    </tr>
+                    {% else %}
+                    <tr>
+                        <td colspan="5" class="py-8 text-center text-slate-400">
+                            Koi lead capture nahi hui hai abhi tak.
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <script>
+        async function updateLeadStatus(leadId, newStatus) {
+            try {
+                const response = await fetch(`/leads/${leadId}/status`, {
+                    method: 'PATCH',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ status: newStatus })
+                });
+                if (!response.ok) {
+                    alert("Status update failed!");
+                }
+            } catch (err) {
+                console.error("Update error:", err);
+                alert("Network error while updating status.");
+            }
+        }
+    </script>
+</body>
+</html>
