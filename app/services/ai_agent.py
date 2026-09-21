@@ -38,17 +38,24 @@ def get_groq_client() -> Optional[Groq]:
         return None
 
 def get_available_chat_models(client: Groq) -> List[str]:
-    """Dynamically fetch all active text-chat models from Groq account."""
+    """Dynamically fetch and prioritize active general chat models."""
     try:
         models_data = client.models.list()
-        active_ids = [m.id for m in models_data.data if m.active]
-        # Prefer llama or mistral chat models, ignore whisper/audio/embeddings
-        chat_models = [m for m in active_ids if "whisper" not in m and "vision" not in m]
-        print(f"[GROQ AVAILABLE MODELS]: {chat_models}")
-        return chat_models
+        active_ids = [m.id for m in models_data.data if getattr(m, 'active', True)]
+        
+        # Non-chat, guardrail aur voice models ko ignore karein
+        ignore_keywords = ["whisper", "vision", "guard", "arabic", "canopylabs", "compound"]
+        chat_models = [m for m in active_ids if not any(k in m.lower() for k in ignore_keywords)]
+        
+        # Verified working models ko pehle rank karein
+        preferred_order = ["openai/gpt-oss-20b", "openai/gpt-oss-120b", "qwen/qwen3.8-27b"]
+        sorted_models = [m for m in preferred_order if m in chat_models] + [m for m in chat_models if m not in preferred_order]
+        
+        print(f"[GROQ PRIORITIZED MODELS]: {sorted_models}")
+        return sorted_models if sorted_models else ["openai/gpt-oss-20b"]
     except Exception as e:
         print(f"[GROQ LIST MODELS ERROR]: {e}")
-        return ["mixtral-8x7b-32768"]
+        return ["openai/gpt-oss-20b"]
 
 def generate_agent_reply(user_message: str) -> str:
     if not user_message or not user_message.strip():
