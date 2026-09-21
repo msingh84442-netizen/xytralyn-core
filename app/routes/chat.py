@@ -16,7 +16,6 @@ def build_chat_history(db: Session, sender_phone: str, limit: int = 6):
     """Database se recent messages nikal kar Groq messages format mein convert karta hai."""
     history = []
     try:
-        # Recent messages descending order mein fetch karein
         records = (
             db.query(Message)
             .filter(Message.sender_phone == sender_phone)
@@ -24,7 +23,6 @@ def build_chat_history(db: Session, sender_phone: str, limit: int = 6):
             .limit(limit)
             .all()
         )
-        # Chronological order ke liye reverse karein
         records.reverse()
 
         for rec in records:
@@ -53,7 +51,7 @@ async def incoming_chat(
     sender_phone = From.replace("whatsapp:", "").strip()
     user_message = Body.strip()
 
-    print(f"\033[96m[DEBUG USER MSG]:\033[0m {user_message} (From: {sender_phone})")
+    print(f"\033[96m[TWILIO USER MSG]:\033[0m {user_message} (From: {sender_phone})")
 
     # Lead extraction
     extracted = extract_lead_info(user_message)
@@ -121,7 +119,7 @@ async def incoming_chat(
     return Response(content=str(resp), media_type="application/xml")
 
 
-# 3. Green-API WhatsApp Webhook POST Route
+# 3. Green-API WhatsApp Webhook POST Route (All Users Supported)
 @router.post("/webhook")
 async def green_api_webhook(request: Request, db: Session = Depends(get_db)):
     try:
@@ -131,27 +129,38 @@ async def green_api_webhook(request: Request, db: Session = Depends(get_db)):
 
     type_webhook = data.get("typeWebhook")
 
+    # Sirf incoming customer text messages handle karein
     if type_webhook != "incomingMessageReceived":
         return {"status": "ignored", "type": type_webhook}
 
     message_data = data.get("messageData", {})
     sender_data = data.get("senderData", {})
 
-    raw_sender = sender_data.get("sender", "")
-    sender_phone = raw_sender.replace("@c.us", "").strip()
+    # Extract sender phone reliably
+    raw_sender = sender_data.get("sender", "") or sender_data.get("chatId", "")
+    sender_phone = raw_sender.replace("@c.us", "").replace("@s.whatsapp.net", "").strip()
 
-    type_msg = message_data.get("typeMessage")
+    # Extract user message safely across different message formats
     user_message = ""
-    if type_msg == "textMessage":
+    if "textMessageData" in message_data:
         user_message = message_data.get("textMessageData", {}).get("textMessage", "")
-    elif type_msg == "extendedTextMessage":
+    elif "extendedTextMessageData" in message_data:
         user_message = message_data.get("extendedTextMessageData", {}).get("text", "")
+    elif isinstance(message_data, str):
+        user_message = message_data
+
+    user_message = user_message.strip()
+
+    print(f"\033[96m[GREEN-API INCOMING]:\033[0m Phone={sender_phone} | Message='{user_message}'")
 
     if not user_message or not sender_phone:
+        print("[GREEN-API SKIP]: Message ya phone number empty tha")
         return {"status": "no_message_or_phone"}
 
+    # 1. Lead extraction
     extracted = extract_lead_info(user_message)
 
+    # 2. Database update or create
     target_lead = db.query(Lead).filter(Lead.phone == sender_phone).first()
     if not target_lead:
         target_lead = Lead(
@@ -171,6 +180,7 @@ async def green_api_webhook(request: Request, db: Session = Depends(get_db)):
         db.commit()
         db.refresh(target_lead)
 
+    # 3. Admin Notification Alert
     try:
         send_admin_alert(
             lead_name=getattr(target_lead, "name", "Lead Customer"),
@@ -180,10 +190,10 @@ async def green_api_webhook(request: Request, db: Session = Depends(get_db)):
     except Exception as alert_err:
         print(f"[ALERT WARNING]: Failed to notify admin: {alert_err}")
 
-    # History fetch karein
+    # 4. History fetch karein
     chat_history = build_chat_history(db, sender_phone, limit=6)
 
-    # Generate reply with context
+    # 5. Generate reply with context
     try:
         ai_response = generate_agent_reply(user_message, history=chat_history)
     except Exception as agent_err:
@@ -191,18 +201,21 @@ async def green_api_webhook(request: Request, db: Session = Depends(get_db)):
         company_name = target_lead.company if target_lead.company and target_lead.company != "N/A" else "Customer"
         ai_response = f"Dhanyavaad, {company_name}! Aapki details note kar li gayi hain. Hamari team aapko jald hi contact karegi."
 
-    # Save to DB
-    msg_record = Message(
-        sender_phone=sender_phone,
-        content=user_message,
-        agent_used="lead-extractor"
-    )
-    if hasattr(msg_record, "agent_reply"):
-        msg_record.agent_reply = ai_response
-    db.add(msg_record)
-    db.commit()
+    # 6. Save to DB
+    try:
+        msg_record = Message(
+            sender_phone=sender_phone,
+            content=user_message,
+            agent_used="lead-extractor"
+        )
+        if hasattr(msg_record, "agent_reply"):
+            msg_record.agent_reply = ai_response
+        db.add(msg_record)
+        db.commit()
+    except Exception as db_err:
+        print(f"[DB SAVE ERROR]: {db_err}")
 
-    # Green-API Dispatch
+    # 7. Green-API Message Dispatch
     instance_id = os.getenv("GREEN_API_INSTANCE_ID")
     token = os.getenv("GREEN_API_TOKEN")
 
@@ -213,7 +226,8 @@ async def green_api_webhook(request: Request, db: Session = Depends(get_db)):
             "message": ai_response
         }
         try:
-            requests.post(send_url, json=payload, timeout=10)
+            r = requests.post(send_url, json=payload, timeout=10)
+            print(f"[GREEN-API DISPATCH]: Status={r.status_code}")
         except Exception as send_err:
             print(f"[GREEN-API SEND ERROR]: {send_err}")
 
