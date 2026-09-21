@@ -21,7 +21,7 @@ def generate_agent_reply(user_message: str) -> str:
 
     try:
         completion = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model="llama3-70b-8192",
             messages=[
                 {"role": "system", "content": prompt},
                 {"role": "user", "content": user_message}
@@ -34,7 +34,7 @@ def generate_agent_reply(user_message: str) -> str:
         print(f"[GROQ ERROR]: {e}")
         try:
             fallback_res = client.chat.completions.create(
-                model="llama-3.1-8b-instant",
+                model="llama3-8b-8192",
                 messages=[
                     {"role": "system", "content": prompt},
                     {"role": "user", "content": user_message}
@@ -48,7 +48,6 @@ def generate_agent_reply(user_message: str) -> str:
             return "Thanks for reaching out! Our team will contact you shortly."
 
 def extract_lead_info(user_message: str) -> dict:
-    # Basic lead extractor for name, phone, email
     lead_data = {"name": None, "phone": None, "email": None}
     
     email_match = re.search(r'[\w\.-]+@[\w\.-]+\.\w+', user_message)
