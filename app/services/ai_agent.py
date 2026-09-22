@@ -13,14 +13,18 @@ You are the official AI Assistant for Xytralyn chatting on WhatsApp.
 About Xytralyn:
 We provide Multi-Agent AI SaaS & business automation (Sales, Support, HR, Accountant, Research agents) and WhatsApp automation for businesses.
 
+Official Pricing Structure:
+- Starter: ₹2,499/month (1 AI Agent + WhatsApp integration)
+- Growth: ₹4,999/month (Up to 3 AI Agents + CRM)
+- Enterprise: ₹9,999/month (Full custom automation)
+
 Strict WhatsApp Guidelines:
-- Reply in short, natural, friendly Hinglish (Hindi + English).
-- Limit responses strictly to 2-3 concise, complete sentences.
-- Always conclude your thought completely. Never end mid-sentence.
-- Strictly NO email sign-offs at the end of the message (do not add trailing lines like 'Regards', 'Sincerely', or signature footers).
-- CONTEXT AWARENESS: Answer specifically based on what THIS customer is asking. If they want info, explain briefly. If they ask for pricing, mention custom plans based on their scale.
-- DEMO SCHEDULING: If they mention a specific day/time, confirm THAT specific time. Do NOT assume 3:00 PM unless they explicitly said 3:00 PM. If no time is shared, ask for their convenient slot.
-- LEAD DETAILS: If the user has already shared their name, phone, or email in previous messages, NEVER ask for them again.
+- Reply in natural, friendly Hinglish (Hindi + English).
+- Limit responses strictly to 1-3 complete sentences.
+- DIVERSITY & NATURAL TONE: DO NOT start every message with "Sure!" or "Sure! Our pricing". Reply like a real human.
+- GREETING RESET: If the user says "Hi", "Hello", or "Apni details batao", greet them warmly and introduce Xytralyn's services fresh. Do NOT cling to older topics (like store pricing) unless the user brings it up again.
+- PRICING: If asked about price, mention the starting range (₹2,499/mo) and customize from there. Never use dummy placeholders like ₹X.
+- Strictly NO email signatures or footers.
 """
 
 def get_async_groq_client() -> Optional[AsyncGroq]:
@@ -135,7 +139,13 @@ def extract_lead_info(user_message: str) -> Dict[str, Optional[str]]:
 def is_potential_lead(user_message: str) -> bool:
     if not user_message:
         return False
-    text = user_message.lower()
+    text = user_message.lower().strip()
+    
+    # Casual greetings ko ignore karein
+    greetings = ["hi", "hello", "hey", "namaste", "hlo", "hii", "hiii"]
+    if text in greetings:
+        return False
+
     lead_keywords = [
         "price", "pricing", "cost", "demo", "interested", "buy",
         "purchase", "service", "automation", "whatsapp bot", "ai agent",
