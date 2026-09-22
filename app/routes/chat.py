@@ -1,7 +1,6 @@
 import os
-import re
 import requests
-from fastapi import APIRouter, Form, Depends, Response, Request, Query, HTTPException
+from fastapi import APIRouter, Depends, Response, Request, Query, HTTPException
 from sqlalchemy.orm import Session
 from twilio.twiml.messaging_response import MessagingResponse
 
@@ -17,8 +16,8 @@ WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
 WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "1359104453944965")
 
 
-def build_chat_history(db: Session, sender_phone: str, limit: int = 6):
-    """Client ke past messages nikalta hai taaki chahe kal baat hui ho ya 1 saal pehle, context bana rahe."""
+def build_chat_history(db: Session, sender_phone: str, limit: int = 4):
+    """Client ke recent messages fetch karta hai taaki zaroorat padne par continuity bani rahe."""
     history = []
     try:
         records = (
@@ -62,13 +61,13 @@ def send_meta_whatsapp_message(to_phone: str, message_text: str):
     }
     try:
         r = requests.post(url, json=payload, headers=headers, timeout=12)
-        print(f"\033[92m[META DISPATCH RESULT]:\033[0m Phone={to_phone} Status={r.status_code} Body={r.text}")
+        print(f"\033[92m[META DISPATCH RESULT]:\033[0m Phone={to_phone} Status={r.status_code}")
     except Exception as err:
         print(f"\033[91m[META SEND EXCEPTION]:\033[0m {err}")
 
 
 # ==========================================
-# 1. WEBHOOK GET VERIFICATION HANDSHAKE
+# 1. WEBHOOK GET VERIFICATION
 # ==========================================
 @router.get("/webhook")
 @router.get("/chat/webhook")
@@ -77,18 +76,14 @@ async def verify_webhook(
     hub_challenge: str = Query(None, alias="hub.challenge"),
     hub_verify_token: str = Query(None, alias="hub.verify_token")
 ):
-    print(f"\033[93m[HANDSHAKE ATTEMPT]:\033[0m mode={hub_mode}, token={hub_verify_token}")
     expected_token = os.getenv("WHATSAPP_VERIFY_TOKEN", VERIFY_TOKEN)
     if hub_mode == "subscribe" and hub_verify_token == expected_token:
-        print("\033[92m[HANDSHAKE SUCCESS]\033[0m")
         return Response(content=hub_challenge, media_type="text/plain")
-
-    print("\033[91m[HANDSHAKE FORBIDDEN]\033[0m")
     raise HTTPException(status_code=403, detail="Verification token mismatch")
 
 
 # ==========================================
-# 2. WEBHOOK POST RECEIVER (META & GREEN-API)
+# 2. WEBHOOK POST RECEIVER
 # ==========================================
 @router.post("/webhook")
 @router.post("/chat/webhook")
@@ -98,11 +93,6 @@ async def webhook_receiver(request: Request, db: Session = Depends(get_db)):
     except Exception as e:
         print(f"[WEBHOOK RAW READ ERROR]: {e}")
         return {"status": "ignored"}
-
-    print(f"\033[95m[INCOMING WEBHOOK RAW BODY]:\033[0m {data}")
-
-    if "typeWebhook" in data:
-        return await handle_green_api(data, db)
 
     sender_phone = None
     user_message = ""
@@ -114,9 +104,6 @@ async def webhook_receiver(request: Request, db: Session = Depends(get_db)):
         messages = val.get("messages", [])
 
         if not messages:
-            statuses = val.get("statuses", [])
-            if statuses:
-                print(f"[META STATUS UPDATE]: {statuses[0].get('status')}")
             return {"status": "ok", "reason": "no_message_body"}
 
         first_msg = messages[0]
@@ -138,16 +125,14 @@ async def webhook_receiver(request: Request, db: Session = Depends(get_db)):
         print(f"[META PARSE ERROR]: {parse_err}")
         return {"status": "parse_error"}
 
-    print(f"\033[96m[USER INCOMING PARSED]:\033[0m Phone={sender_phone} Msg='{user_message}'")
-
     if not sender_phone or not user_message:
         return {"status": "empty_sender_or_message"}
 
-    # 1. Lead extraction aur Intent check
+    # 1. Lead extraction aur Commercial Intent analysis
     extracted = extract_lead_info(user_message)
     high_intent = is_potential_lead(user_message)
 
-    # 2. Database Lead entry
+    # 2. Lead record management
     target_lead = db.query(Lead).filter(Lead.phone == sender_phone).first()
     if not target_lead:
         target_lead = Lead(
@@ -167,7 +152,7 @@ async def webhook_receiver(request: Request, db: Session = Depends(get_db)):
         db.commit()
         db.refresh(target_lead)
 
-    # 3. Admin notification (Only genuine lead info / high intent)
+    # 3. Admin Notification (Sirf phone/email aane par ya actual requirement poochne par)
     has_contact = bool(extracted.get("phone") or extracted.get("email"))
     if has_contact or high_intent:
         try:
@@ -176,36 +161,19 @@ async def webhook_receiver(request: Request, db: Session = Depends(get_db)):
                 company=getattr(target_lead, "company", "N/A"),
                 phone=sender_phone
             )
-            print(f"\033[92m[ADMIN ALERT DISPATCHED]:\033[0m Lead from {sender_phone}")
+            print(f"\033[92m[ADMIN ALERT DISPATCHED]:\033[0m Genuine query from {sender_phone}")
         except Exception as alert_err:
             print(f"[ALERT WARNING]: {alert_err}")
-    else:
-        print(f"[CASUAL MESSAGE]: '{user_message}' - Admin alert skipped.")
 
-    # 4. Instant Greeting & Reset Handlers
-    clean_raw = re.sub(r"[^\w\s]", "", user_message).strip().lower()
-    casual_greetings = {"hi", "hello", "hey", "hii", "hiii", "namaste", "hlo", "yo"}
-    islamic_greetings = {"ashlaa valekum", "assalamu alaikum", "salam", "walekum assalam"}
-    traditional_greetings = {"ram ram", "radhe radhe", "jai shree ram", "pranam"}
+    # 4. Pure Dynamic AI Agent Processing (No hardcoded if-else keywords)
+    chat_history = build_chat_history(db, sender_phone, limit=4)
+    try:
+        ai_response = await generate_agent_reply(user_message, history=chat_history)
+    except Exception as agent_err:
+        print(f"[AI AGENT ERROR]: {agent_err}")
+        ai_response = "Hey! 👋 Xytralyn me aapka swagat hai. Aaj main aapki kya madad kar sakta hoon?"
 
-    if clean_raw in casual_greetings:
-        ai_response = "Hey! 👋 Welcome to Xytralyn. How can I help you today?"
-    elif clean_raw in islamic_greetings:
-        ai_response = "Walaikum Assalam bhai! 🙏 Xytralyn me aapka swagat hai. Aaj aapki kya help kar sakta hoon?"
-    elif clean_raw in traditional_greetings:
-        ai_response = "Ram Ram ji! 🙏 Xytralyn me aapka swagat hai. Aaj aapki kya sahayata kar sakta hoon?"
-    elif clean_raw in {"reset", "new chat", "start fresh", "clear"}:
-        ai_response = "Zaroor! Nayi conversation start karte hain. 😊 Bataiye, aaj main aapki kya help kar sakta hoon?"
-    else:
-        # LLM Generation for actual business discussions
-        chat_history = build_chat_history(db, sender_phone, limit=4)
-        try:
-            ai_response = await generate_agent_reply(user_message, history=chat_history)
-        except Exception as agent_err:
-            print(f"[AI AGENT ERROR]: {agent_err}")
-            ai_response = "Hey! 👋 Xytralyn me aapka swagat hai. Hum WhatsApp & AI automation banate hain. Aaj aapki kya help kar sakta hoon?"
-
-    # 5. Save message record
+    # 5. Message record save
     try:
         msg_record = Message(
             sender_phone=sender_phone,
@@ -219,79 +187,15 @@ async def webhook_receiver(request: Request, db: Session = Depends(get_db)):
     except Exception as db_err:
         print(f"[DB RECORD SAVE ERROR]: {db_err}")
 
-    # 6. Dispatch reply back to WhatsApp
+    # 6. Response dispatch
     send_meta_whatsapp_message(to_phone=sender_phone, message_text=ai_response)
 
-    return {"status": "success"}
-
-
-async def handle_green_api(data: dict, db: Session):
-    """Green-API webhook handler fallback."""
-    if data.get("typeWebhook") != "incomingMessageReceived":
-        return {"status": "ignored"}
-
-    msg_data = data.get("messageData", {})
-    sender_data = data.get("senderData", {})
-    raw_sender = sender_data.get("sender", "") or sender_data.get("chatId", "")
-    sender_phone = raw_sender.replace("@c.us", "").replace("@s.whatsapp.net", "").strip()
-
-    user_message = ""
-    if "textMessageData" in msg_data:
-        user_message = msg_data.get("textMessageData", {}).get("textMessage", "")
-    elif "extendedTextMessageData" in msg_data:
-        user_message = msg_data.get("extendedTextMessageData", {}).get("text", "")
-
-    user_message = str(user_message).strip()
-    if not user_message or not sender_phone:
-        return {"status": "no_text"}
-
-    extracted = extract_lead_info(user_message)
-    high_intent = is_potential_lead(user_message)
-
-    target_lead = db.query(Lead).filter(Lead.phone == sender_phone).first()
-    if not target_lead:
-        target_lead = Lead(phone=sender_phone, name=extracted.get("name") or "Lead Customer", company="N/A", status="New")
-        db.add(target_lead)
-        db.commit()
-        db.refresh(target_lead)
-
-    has_contact = bool(extracted.get("phone") or extracted.get("email"))
-    if has_contact or high_intent:
-        try:
-            send_admin_alert(
-                lead_name=getattr(target_lead, "name", "Lead Customer"),
-                company="N/A",
-                phone=sender_phone
-            )
-        except Exception:
-            pass
-
-    chat_history = build_chat_history(db, sender_phone, limit=6)
-    try:
-        ai_response = await generate_agent_reply(user_message, history=chat_history)
-    except Exception:
-        ai_response = "Aapka message mil gaya hai."
-
-    inst_id = os.getenv("GREEN_API_INSTANCE_ID")
-    tok = os.getenv("GREEN_API_TOKEN")
-    if inst_id and tok:
-        requests.post(
-            f"https://7107.api.greenapi.com/waInstance{inst_id}/sendMessage/{tok}",
-            json={"chatId": f"{sender_phone}@c.us", "message": ai_response},
-            timeout=12
-        )
     return {"status": "success"}
 
 
 # ==========================================
 # 3. TWILIO COMPATIBILITY
 # ==========================================
-@router.get("/incoming")
-@router.get("/chat/incoming")
-async def incoming_chat_get():
-    return Response(content="<Response/>", media_type="application/xml")
-
-
 @router.post("/incoming")
 @router.post("/chat/incoming")
 async def incoming_chat(
@@ -302,32 +206,8 @@ async def incoming_chat(
     sender_phone = From.replace("whatsapp:", "").strip()
     user_message = Body.strip()
 
-    extracted = extract_lead_info(user_message)
-    high_intent = is_potential_lead(user_message)
-
-    target_lead = db.query(Lead).filter(Lead.phone == sender_phone).first()
-    if not target_lead:
-        target_lead = Lead(phone=sender_phone, name=extracted.get("name") or "Lead Customer", company="N/A", status="New")
-        db.add(target_lead)
-        db.commit()
-        db.refresh(target_lead)
-
-    has_contact = bool(extracted.get("phone") or extracted.get("email"))
-    if has_contact or high_intent:
-        try:
-            send_admin_alert(
-                lead_name=getattr(target_lead, "name", "Lead Customer"),
-                company="N/A",
-                phone=sender_phone
-            )
-        except Exception:
-            pass
-
-    chat_history = build_chat_history(db, sender_phone, limit=6)
-    try:
-        ai_response = await generate_agent_reply(user_message, history=chat_history)
-    except Exception:
-        ai_response = "Dhanyavaad! Message prapt hua."
+    chat_history = build_chat_history(db, sender_phone, limit=4)
+    ai_response = await generate_agent_reply(user_message, history=chat_history)
 
     resp = MessagingResponse()
     resp.message(str(ai_response))
