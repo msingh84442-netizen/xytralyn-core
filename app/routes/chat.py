@@ -1,24 +1,53 @@
 import os
+import logging
+from typing import List, Dict, Any
+
 import requests
-from fastapi import APIRouter, Depends, Response, Request, Query, HTTPException
+from fastapi import (
+    APIRouter,
+    Depends,
+    Response,
+    Request,
+    Query,
+    HTTPException,
+)
 from sqlalchemy.orm import Session
 from twilio.twiml.messaging_response import MessagingResponse
 
 from app.database import get_db
 from app.models import Lead, Message
-from app.services.ai_agent import extract_lead_info, is_potential_lead, generate_agent_reply
+from app.services.ai_agent import (
+    extract_lead_info,
+    is_potential_lead,
+    generate_agent_reply,
+)
 from app.services.notifier import send_admin_alert
+
 
 router = APIRouter(tags=["Chat"])
 
-VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "xytralyn_secret_verify_token_2026")
+logger = logging.getLogger(__name__)
+
+VERIFY_TOKEN = os.getenv(
+    "WHATSAPP_VERIFY_TOKEN",
+    "xytralyn_secret_verify_token_2026",
+)
+
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
-WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "1359104453944965")
+
+WHATSAPP_PHONE_NUMBER_ID = os.getenv(
+    "WHATSAPP_PHONE_NUMBER_ID",
+    "1359104453944965",
+)
 
 
-def build_chat_history(db: Session, sender_phone: str, limit: int = 4):
-    """Client ke recent messages fetch karta hai taaki conversation smooth rahe."""
+def build_chat_history(
+    db: Session,
+    sender_phone: str,
+    limit: int = 6,
+) -> List[Dict[str, str]]:
     history = []
+
     try:
         records = (
             db.query(Message)
@@ -27,188 +56,272 @@ def build_chat_history(db: Session, sender_phone: str, limit: int = 4):
             .limit(limit)
             .all()
         )
-        records = sorted(records, key=lambda x: x.id)
 
-        for rec in records:
-            if rec.content:
-                history.append({"role": "user", "content": rec.content})
-            if hasattr(rec, "agent_reply") and rec.agent_reply:
-                history.append({"role": "assistant", "content": rec.agent_reply})
-    except Exception as err:
-        print(f"[HISTORY FETCH ERROR]: {err}")
-    return history
+        for record in reversed(records):
+            user_message = getattr(record, "content", None)
+            agent_reply = getattr(record, "agent_reply", None)
+
+            if user_message:
+                history.append(
+                    {
+                        "role": "user",
+                        "content": str(user_message).strip(),
+                    }
+                )
+
+            if agent_reply:
+                history.append(
+                    {
+                        "role": "assistant",
+                        "content": str(agent_reply).strip(),
+                    }
+                )
+
+    except Exception:
+        logger.exception("Could not fetch chat history")
+
+    return history[-limit:]
 
 
-def send_meta_whatsapp_message(to_phone: str, message_text: str):
-    """Meta WhatsApp Cloud API ke through user ko response bhejta hai."""
+def send_meta_whatsapp_message(
+    to_phone: str,
+    message_text: str,
+) -> bool:
     token = os.getenv("WHATSAPP_TOKEN") or WHATSAPP_TOKEN
     phone_id = os.getenv("WHATSAPP_PHONE_NUMBER_ID") or WHATSAPP_PHONE_NUMBER_ID
 
     if not token or not phone_id:
-        print("\033[91m[META SEND ERROR]: Missing WHATSAPP_TOKEN or WHATSAPP_PHONE_NUMBER_ID\033[0m")
-        return
+        logger.error("WhatsApp token or phone ID is missing")
+        return False
 
     url = f"https://graph.facebook.com/v20.0/{phone_id}/messages"
+
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
     }
+
     payload = {
         "messaging_product": "whatsapp",
         "to": to_phone,
         "type": "text",
-        "text": {"body": message_text},
+        "text": {
+            "body": message_text,
+        },
     }
+
     try:
-        r = requests.post(url, json=payload, headers=headers, timeout=12)
-        print(f"\033[92m[META DISPATCH RESULT]:\033[0m Phone={to_phone} Status={r.status_code}")
-    except Exception as err:
-        print(f"\033[91m[META SEND EXCEPTION]:\033[0m {err}")
+        result = requests.post(
+            url,
+            json=payload,
+            headers=headers,
+            timeout=15,
+        )
+
+        logger.info("WhatsApp response status=%s", result.status_code)
+        result.raise_for_status()
+        return True
+
+    except requests.RequestException:
+        logger.exception("WhatsApp message sending failed")
+        return False
 
 
-# ==========================================
-# 1. WEBHOOK GET VERIFICATION
-# ==========================================
+def parse_meta_message(data: Dict[str, Any]):
+    try:
+        entry = data.get("entry", [{}])[0]
+        changes = entry.get("changes", [{}])[0]
+        value = changes.get("value", {})
+        messages = value.get("messages", [])
+
+        if not messages:
+            return None, ""
+
+        first_message = messages[0]
+        sender_phone = str(first_message.get("from", "")).strip()
+        message_type = first_message.get("type", "text")
+
+        user_message = ""
+
+        if message_type == "text":
+            user_message = str(
+                first_message.get("text", {}).get("body", "")
+            ).strip()
+
+        elif message_type == "button":
+            user_message = str(
+                first_message.get("button", {}).get("text", "")
+            ).strip()
+
+        elif message_type == "interactive":
+            interactive = first_message.get("interactive", {})
+            if "button_reply" in interactive:
+                user_message = str(
+                    interactive["button_reply"].get("title", "")
+                ).strip()
+            elif "list_reply" in interactive:
+                user_message = str(
+                    interactive["list_reply"].get("title", "")
+                ).strip()
+
+        return sender_phone, user_message
+
+    except Exception:
+        logger.exception("Could not parse Meta message")
+        return None, ""
+
+
+def update_or_create_lead(
+    db: Session,
+    sender_phone: str,
+    extracted: Dict[str, Any],
+):
+    lead = db.query(Lead).filter(Lead.phone == sender_phone).first()
+
+    if not lead:
+        lead = Lead(
+            phone=sender_phone,
+            name=extracted.get("name") or "Lead Customer",
+            company=extracted.get("company") or "N/A",
+            status="New",
+        )
+        db.add(lead)
+    else:
+        if extracted.get("name"):
+            lead.name = extracted["name"]
+        if extracted.get("company"):
+            lead.company = extracted["company"]
+
+    db.commit()
+    db.refresh(lead)
+    return lead
+
+
+def save_message(
+    db: Session,
+    sender_phone: str,
+    user_message: str,
+    ai_response: str,
+):
+    try:
+        record = Message(
+            sender_phone=sender_phone,
+            content=user_message,
+            agent_used="dynamic-ai-agent",
+        )
+
+        if hasattr(record, "agent_reply"):
+            record.agent_reply = ai_response
+
+        db.add(record)
+        db.commit()
+
+    except Exception:
+        db.rollback()
+        logger.exception("Could not save message")
+
+
+async def process_message(
+    db: Session,
+    sender_phone: str,
+    user_message: str,
+) -> str:
+    if not sender_phone or not user_message:
+        return ""
+
+    extracted = extract_lead_info(user_message)
+    high_intent = is_potential_lead(user_message)
+
+    lead = None
+    try:
+        lead = update_or_create_lead(db, sender_phone, extracted)
+    except Exception:
+        db.rollback()
+        logger.exception("Lead processing failed")
+
+    has_contact = bool(extracted.get("phone") or extracted.get("email"))
+
+    if has_contact or high_intent:
+        try:
+            send_admin_alert(
+                lead_name=getattr(lead, "name", "Lead Customer"),
+                company=getattr(lead, "company", "N/A"),
+                phone=sender_phone,
+            )
+        except Exception:
+            logger.exception("Admin notification failed")
+
+    history = build_chat_history(db, sender_phone, limit=6)
+
+    try:
+        ai_response = await generate_agent_reply(user_message, history)
+    except Exception:
+        logger.exception("AI generation failed")
+        ai_response = "Mujhe is waqt response generate karne mein temporary issue aa raha hai. Kripya ek pal baad dobara try karein."
+
+    save_message(db, sender_phone, user_message, ai_response)
+    return ai_response
+
+
 @router.get("/webhook")
 @router.get("/chat/webhook")
 async def verify_webhook(
     hub_mode: str = Query(None, alias="hub.mode"),
     hub_challenge: str = Query(None, alias="hub.challenge"),
-    hub_verify_token: str = Query(None, alias="hub.verify_token")
+    hub_verify_token: str = Query(None, alias="hub.verify_token"),
 ):
     expected_token = os.getenv("WHATSAPP_VERIFY_TOKEN", VERIFY_TOKEN)
+
     if hub_mode == "subscribe" and hub_verify_token == expected_token:
-        return Response(content=hub_challenge, media_type="text/plain")
-    raise HTTPException(status_code=403, detail="Verification token mismatch")
+        return Response(content=hub_challenge or "", media_type="text/plain")
+
+    raise HTTPException(
+        status_code=403,
+        detail="Verification token mismatch",
+    )
 
 
-# ==========================================
-# 2. WEBHOOK POST RECEIVER
-# ==========================================
 @router.post("/webhook")
 @router.post("/chat/webhook")
-async def webhook_receiver(request: Request, db: Session = Depends(get_db)):
+async def webhook_receiver(
+    request: Request,
+    db: Session = Depends(get_db),
+):
     try:
         data = await request.json()
-    except Exception as e:
-        print(f"[WEBHOOK RAW READ ERROR]: {e}")
+    except Exception:
+        logger.exception("Could not read webhook JSON")
         return {"status": "ignored"}
 
-    sender_phone = None
-    user_message = ""
-
-    try:
-        entry = data.get("entry", [{}])[0]
-        changes = entry.get("changes", [{}])[0]
-        val = changes.get("value", {})
-        messages = val.get("messages", [])
-
-        if not messages:
-            return {"status": "ok", "reason": "no_message_body"}
-
-        first_msg = messages[0]
-        sender_phone = first_msg.get("from", "").strip()
-
-        msg_type = first_msg.get("type", "text")
-        if msg_type == "text":
-            user_message = first_msg.get("text", {}).get("body", "").strip()
-        elif msg_type == "button":
-            user_message = first_msg.get("button", {}).get("text", "").strip()
-        elif msg_type == "interactive":
-            inter = first_msg.get("interactive", {})
-            if "button_reply" in inter:
-                user_message = inter["button_reply"].get("title", "")
-            elif "list_reply" in inter:
-                user_message = inter["list_reply"].get("title", "")
-
-    except Exception as parse_err:
-        print(f"[META PARSE ERROR]: {parse_err}")
-        return {"status": "parse_error"}
+    sender_phone, user_message = parse_meta_message(data)
 
     if not sender_phone or not user_message:
-        return {"status": "empty_sender_or_message"}
+        return {"status": "ok", "reason": "no_message"}
 
-    # 1. Lead extraction aur Commercial Intent analysis
-    extracted = extract_lead_info(user_message)
-    high_intent = is_potential_lead(user_message)
+    ai_response = await process_message(db, sender_phone, user_message)
 
-    # 2. Lead record management
-    target_lead = db.query(Lead).filter(Lead.phone == sender_phone).first()
-    if not target_lead:
-        target_lead = Lead(
-            phone=sender_phone,
-            name=extracted.get("name") or "Lead Customer",
-            company=extracted.get("company") or "N/A",
-            status="New"
-        )
-        db.add(target_lead)
-        db.commit()
-        db.refresh(target_lead)
-    else:
-        if extracted.get("name") and extracted.get("name") != "Lead Customer":
-            target_lead.name = extracted.get("name")
-        if extracted.get("company") and extracted.get("company") != "N/A":
-            target_lead.company = extracted.get("company")
-        db.commit()
-        db.refresh(target_lead)
-
-    # 3. Admin Notification (Sirf phone/email aane par ya actual commercial requirement poochne par)
-    has_contact = bool(extracted.get("phone") or extracted.get("email"))
-    if has_contact or high_intent:
-        try:
-            send_admin_alert(
-                lead_name=getattr(target_lead, "name", "Lead Customer"),
-                company=getattr(target_lead, "company", "N/A"),
-                phone=sender_phone
-            )
-            print(f"\033[92m[ADMIN ALERT DISPATCHED]:\033[0m Genuine query from {sender_phone}")
-        except Exception as alert_err:
-            print(f"[ALERT WARNING]: {alert_err}")
-
-    # 4. Pure Dynamic AI Agent Processing (No hardcoded if-else keywords)
-    chat_history = build_chat_history(db, sender_phone, limit=4)
-    try:
-        ai_response = await generate_agent_reply(user_message, history=chat_history)
-    except Exception as agent_err:
-        print(f"\033[91m[AI AGENT ERROR]:\033[0m {agent_err}")
-        ai_response = "Hey! 👋 Xytralyn me aapka swagat hai. Aaj main aapki kya madad kar sakta hoon?"
-
-    # 5. Message record save
-    try:
-        msg_record = Message(
-            sender_phone=sender_phone,
-            content=user_message,
-            agent_used="lead-extractor"
-        )
-        if hasattr(msg_record, "agent_reply"):
-            msg_record.agent_reply = ai_response
-        db.add(msg_record)
-        db.commit()
-    except Exception as db_err:
-        print(f"[DB RECORD SAVE ERROR]: {db_err}")
-
-    # 6. Response dispatch to WhatsApp
-    send_meta_whatsapp_message(to_phone=sender_phone, message_text=ai_response)
+    if ai_response:
+        send_meta_whatsapp_message(sender_phone, ai_response)
 
     return {"status": "success"}
 
 
-# ==========================================
-# 3. TWILIO COMPATIBILITY (Form dependency free)
-# ==========================================
 @router.post("/incoming")
 @router.post("/chat/incoming")
 async def incoming_chat(
     request: Request,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
     form_data = await request.form()
     sender_phone = str(form_data.get("From", "")).replace("whatsapp:", "").strip()
     user_message = str(form_data.get("Body", "")).strip()
 
-    chat_history = build_chat_history(db, sender_phone, limit=4)
-    ai_response = await generate_agent_reply(user_message, history=chat_history)
+    ai_response = await process_message(db, sender_phone, user_message)
 
-    resp = MessagingResponse()
-    resp.message(str(ai_response))
-    return Response(content=str(resp), media_type="application/xml")
+    twilio_response = MessagingResponse()
+    twilio_response.message(str(ai_response))
+
+    return Response(
+        content=str(twilio_response),
+        media_type="application/xml",
+    )
