@@ -182,21 +182,28 @@ async def webhook_receiver(request: Request, db: Session = Depends(get_db)):
     else:
         print(f"[CASUAL MESSAGE]: '{user_message}' - Admin alert skipped.")
 
-    # 4. Check for user-requested Fresh Start
+    # 4. Instant Greeting & Reset Handlers
     clean_raw = re.sub(r"[^\w\s]", "", user_message).strip().lower()
-    reset_triggers = {"reset", "new chat", "start fresh", "clear", "naye se start karo"}
-    
-    if clean_raw in reset_triggers:
-        chat_history = []
+    casual_greetings = {"hi", "hello", "hey", "hii", "hiii", "namaste", "hlo", "yo"}
+    islamic_greetings = {"ashlaa valekum", "assalamu alaikum", "salam", "walekum assalam"}
+    traditional_greetings = {"ram ram", "radhe radhe", "jai shree ram", "pranam"}
+
+    if clean_raw in casual_greetings:
+        ai_response = "Hey! 👋 Welcome to Xytralyn. How can I help you today?"
+    elif clean_raw in islamic_greetings:
+        ai_response = "Walaikum Assalam bhai! 🙏 Xytralyn me aapka swagat hai. Aaj aapki kya help kar sakta hoon?"
+    elif clean_raw in traditional_greetings:
+        ai_response = "Ram Ram ji! 🙏 Xytralyn me aapka swagat hai. Aaj aapki kya sahayata kar sakta hoon?"
+    elif clean_raw in {"reset", "new chat", "start fresh", "clear"}:
         ai_response = "Zaroor! Nayi conversation start karte hain. 😊 Bataiye, aaj main aapki kya help kar sakta hoon?"
     else:
-        chat_history = build_chat_history(db, sender_phone, limit=6)
+        # LLM Generation for actual business discussions
+        chat_history = build_chat_history(db, sender_phone, limit=4)
         try:
             ai_response = await generate_agent_reply(user_message, history=chat_history)
         except Exception as agent_err:
             print(f"[AI AGENT ERROR]: {agent_err}")
-            c_name = target_lead.company if target_lead.company and target_lead.company != "N/A" else "Customer"
-            ai_response = f"Dhanyavaad, {c_name}! Aapka message mil gaya hai. Hum jaldi contact karenge."
+            ai_response = "Hey! 👋 Xytralyn me aapka swagat hai. Hum WhatsApp & AI automation banate hain. Aaj aapki kya help kar sakta hoon?"
 
     # 5. Save message record
     try:
