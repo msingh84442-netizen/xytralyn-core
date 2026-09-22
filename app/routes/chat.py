@@ -7,7 +7,7 @@ from twilio.twiml.messaging_response import MessagingResponse
 
 from app.database import get_db
 from app.models import Lead, Message
-from app.services.ai_agent import extract_lead_info, generate_agent_reply
+from app.services.ai_agent import extract_lead_info, is_potential_lead, generate_agent_reply
 from app.services.notifier import send_admin_alert
 
 router = APIRouter(tags=["Chat"])
@@ -145,8 +145,9 @@ async def webhook_receiver(request: Request, db: Session = Depends(get_db)):
     if not sender_phone or not user_message:
         return {"status": "empty_sender_or_message"}
 
-    # 1. Lead extraction
+    # 1. Lead extraction aur Intent analysis
     extracted = extract_lead_info(user_message)
+    high_intent = is_potential_lead(user_message)
 
     # 2. Database Lead entry
     target_lead = db.query(Lead).filter(Lead.phone == sender_phone).first()
@@ -168,15 +169,20 @@ async def webhook_receiver(request: Request, db: Session = Depends(get_db)):
         db.commit()
         db.refresh(target_lead)
 
-    # 3. Admin notification
-    try:
-        send_admin_alert(
-            lead_name=getattr(target_lead, "name", "Lead Customer"),
-            company=getattr(target_lead, "company", "N/A"),
-            phone=sender_phone
-        )
-    except Exception as alert_err:
-        print(f"[ALERT WARNING]: {alert_err}")
+    # 3. Admin notification (SIRF tabhi trigger hoga jab customer info share kare ya actual requirement/pricing puche)
+    has_contact_info = bool(extracted.get("phone") or extracted.get("email") or extracted.get("name"))
+    if has_contact_info or high_intent:
+        try:
+            send_admin_alert(
+                lead_name=getattr(target_lead, "name", "Lead Customer"),
+                company=getattr(target_lead, "company", "N/A"),
+                phone=sender_phone
+            )
+            print(f"\033[92m[ADMIN ALERT DISPATCHED]:\033[0m Genuine Lead from {sender_phone}")
+        except Exception as alert_err:
+            print(f"[ALERT WARNING]: {alert_err}")
+    else:
+        print(f"[CASUAL MESSAGE]: '{user_message}' - Admin alert skipped.")
 
     # 4. Conversation context
     chat_history = build_chat_history(db, sender_phone, limit=6)
@@ -230,12 +236,26 @@ async def handle_green_api(data: dict, db: Session):
         return {"status": "no_text"}
 
     extracted = extract_lead_info(user_message)
+    high_intent = is_potential_lead(user_message)
+
     target_lead = db.query(Lead).filter(Lead.phone == sender_phone).first()
     if not target_lead:
         target_lead = Lead(phone=sender_phone, name=extracted.get("name") or "Lead Customer", company="N/A", status="New")
         db.add(target_lead)
         db.commit()
         db.refresh(target_lead)
+
+    # Green-API ke liye bhi check
+    has_contact_info = bool(extracted.get("phone") or extracted.get("email") or extracted.get("name"))
+    if has_contact_info or high_intent:
+        try:
+            send_admin_alert(
+                lead_name=getattr(target_lead, "name", "Lead Customer"),
+                company="N/A",
+                phone=sender_phone
+            )
+        except Exception:
+            pass
 
     chat_history = build_chat_history(db, sender_phone, limit=6)
     try:
@@ -274,12 +294,26 @@ async def incoming_chat(
     user_message = Body.strip()
 
     extracted = extract_lead_info(user_message)
+    high_intent = is_potential_lead(user_message)
+
     target_lead = db.query(Lead).filter(Lead.phone == sender_phone).first()
     if not target_lead:
         target_lead = Lead(phone=sender_phone, name=extracted.get("name") or "Lead Customer", company="N/A", status="New")
         db.add(target_lead)
         db.commit()
         db.refresh(target_lead)
+
+    # Twilio alerts filter
+    has_contact_info = bool(extracted.get("phone") or extracted.get("email") or extracted.get("name"))
+    if has_contact_info or high_intent:
+        try:
+            send_admin_alert(
+                lead_name=getattr(target_lead, "name", "Lead Customer"),
+                company="N/A",
+                phone=sender_phone
+            )
+        except Exception:
+            pass
 
     chat_history = build_chat_history(db, sender_phone, limit=6)
     try:
@@ -289,4 +323,4 @@ async def incoming_chat(
 
     resp = MessagingResponse()
     resp.message(str(ai_response))
-    return Response(content=str(resp), media_type="application/xml") 
+    return Response(content=str(resp), media_type="application/xml")
