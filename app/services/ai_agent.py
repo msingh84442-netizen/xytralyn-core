@@ -8,22 +8,32 @@ from dotenv import load_dotenv
 load_dotenv()
 
 SYSTEM_PROMPT = """
-You are the official AI Assistant for Xytralyn on WhatsApp.
+You are the official AI Assistant for Xytralyn (AI Automation Agency) chatting on WhatsApp.
 
 About Xytralyn:
-We provide Multi-Agent AI SaaS & business automation (Sales, Support, HR, Accountant, Research) and WhatsApp automation for businesses.
+We provide Multi-Agent AI SaaS & business automation (Sales, Support, HR, Accountant, Research agents) and WhatsApp automation for businesses.
 
-Official Plans:
-- Starter: ₹2,499/month
-- Growth: ₹4,999/month
-- Enterprise: ₹9,999/month
+Official Pricing Structure:
+- Starter: ₹2,499/month (Includes 1 AI Agent + WhatsApp integration)
+- Growth: ₹4,999/month (Up to 3 AI Agents + CRM Lead Capture)
+- Enterprise: ₹9,999/month (Full custom multi-agent automation)
 
-Strict Guidelines:
-1. FOCUS ONLY ON THE LATEST MESSAGE: Never bring up older topics (like stores, quotes, or pricing) unless the user's latest message specifically asks about them.
-2. BREVITY: Keep answers strictly under 2 concise sentences.
-3. CONVERSATIONAL: Speak in natural, friendly Hinglish.
-4. NO DUMMY VALUES: Always use exact pricing (₹2,499/mo, etc.). Never use placeholders like ₹X or [price].
-5. NO SIGN-OFFS: Strictly NO email footers, sign-offs, or signatures (never write 'Regards', 'Sincerely', or 'Xytralyn AI Assistant' at the end).
+Human-Like Conversation Guidelines:
+1. TONE & CULTURAL MIRRORING:
+   - Match the user's greeting naturally and respectfully.
+   - If they say 'Ram Ram', respond with 'Ram Ram ji! 🙏'.
+   - If they say 'Hi', 'Hello', 'Good Morning', or 'Namaste', mirror their vibe with warmth.
+
+2. CONVERSATION CONTEXT & CONTINUITY:
+   - You have access to past chat history. If a user returns after hours, days, or months and asks about a past discussion (e.g. 'kal jo plan discuss kiya tha', 'store bot ka demo aage batao'), pick up smoothly from where you left off.
+   - If the user ONLY sends a casual greeting (like just 'Hi' or 'Ram Ram'), greet them back warmly and ask how you can assist them today. DO NOT unpromptedly repeat older pricing or store details.
+   - If the user explicitly asks to start fresh (e.g. 'new conversation', 'fresh chat', 'naye se baat karo', 'reset'), acknowledge politely and begin fresh.
+
+3. CONCISE & ACTIONABLE:
+   - WhatsApp replies must be crisp: strictly 2-3 natural sentences.
+   - Never end sentences abruptly. Complete your thought cleanly.
+   - PRICING: Always quote actual figures (₹2,499/mo, ₹4,999/mo, etc.). Strictly NEVER use placeholder variables like ₹X or [price].
+   - Strictly NO email sign-offs, regards, or signature footers at the end of the text.
 """
 
 def get_async_groq_client() -> Optional[AsyncGroq]:
@@ -38,7 +48,6 @@ def get_async_groq_client() -> Optional[AsyncGroq]:
         return None
 
 async def get_available_chat_models(client: AsyncGroq) -> List[str]:
-    """Dynamically fetch and prioritize active production chat models."""
     fallback_models = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
     try:
         models_data = await client.models.list()
@@ -61,17 +70,22 @@ async def get_available_chat_models(client: AsyncGroq) -> List[str]:
 
 async def generate_agent_reply(user_message: str, history: Optional[List[Dict[str, str]]] = None) -> str:
     if not user_message or not user_message.strip():
-        return "Namaste! 👋 Main Xytralyn AI assistant hoon. Aaj aapki kya sahayata kar sakta hoon?"
+        return "Namaste! 🙏 Main Xytralyn AI assistant hoon. Aaj aapki kya sahayata kar sakta hoon?"
 
     client = get_async_groq_client()
     if client is None:
         return "Dhanyavaad! 🙏 Hamari team aapki query check karke aapse jaldi contact karegi."
 
+    # Check for explicit reset intent
+    lower_msg = user_message.strip().lower()
+    reset_keywords = ["reset", "new chat", "clear history", "start fresh", "naye se start karo"]
+    if any(k in lower_msg for k in reset_keywords):
+        history = []
+
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
-    # Only include recent context to avoid topic lock
     if history and isinstance(history, list):
-        for msg in history[-4:]:
+        for msg in history[-8:]:  # Memory depth for ongoing context
             messages.append(msg)
 
     messages.append({"role": "user", "content": user_message.strip()})
@@ -83,13 +97,14 @@ async def generate_agent_reply(user_message: str, history: Optional[List[Dict[st
             completion = await client.chat.completions.create(
                 model=model_id,
                 messages=messages,
-                temperature=0.3,
+                temperature=0.35,
                 max_tokens=600
             )
             reply = completion.choices[0].message.content
             if reply and reply.strip():
-                # Strip trailing sign-offs without cutting genuine body sentences
+                # Strip trailing sign-offs & broken brackets safely
                 cleaned_reply = re.sub(r'(?i)\n+(regards|sincerely|best regards|thanks & regards)[\s\S]*$', '', reply.strip()).strip()
+                cleaned_reply = re.sub(r'[\]\(\)\<\>]+$', '', cleaned_reply).strip()
                 return cleaned_reply if cleaned_reply else reply.strip()
         except Exception as e:
             print(f"[GROQ ASYNC MODEL FAILED] Model={model_id} | Error={e}")
@@ -140,9 +155,13 @@ def is_potential_lead(user_message: str) -> bool:
         return False
     text = user_message.lower().strip()
     
-    # Ignore purely casual greetings or single-word texts
-    greetings = {"hi", "hello", "hey", "namaste", "hlo", "hii", "hiii", "yo", "kya haal hai"}
-    if text in greetings:
+    # Casual greetings list to ignore
+    casual_words = {
+        "hi", "hello", "hey", "namaste", "hlo", "hii", "hiii", "yo", "hola",
+        "ram ram", "radhe radhe", "jai shree ram", "pranam", "kya haal hai", "good morning"
+    }
+    cleaned_input = re.sub(r"[^\w\s]", "", text).strip()
+    if cleaned_input in casual_words:
         return False
 
     lead_keywords = [
@@ -150,4 +169,4 @@ def is_potential_lead(user_message: str) -> bool:
         "purchase", "service", "automation", "whatsapp bot", "ai agent",
         "website", "web development", "need", "requirement", "quotation"
     ]
-    return any(re.search(rf"\b{re.escape(keyword)}\b", text) for keyword in lead_keywords)
+    return any(re.search(rf"\b{re.escape(k)}\b", text) for k in lead_keywords)
