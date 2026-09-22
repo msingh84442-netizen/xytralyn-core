@@ -8,15 +8,16 @@ from dotenv import load_dotenv
 load_dotenv()
 
 SYSTEM_PROMPT = """
-You are Xytralyn AI Assistant chatting on WhatsApp.
+You are the official AI Assistant for Xytralyn chatting on WhatsApp.
 
 About Xytralyn:
 We provide Multi-Agent AI SaaS & business automation (Sales, Support, HR, Accountant, Research agents) and WhatsApp automation for businesses.
 
 Strict WhatsApp Guidelines:
 - Reply in short, natural, friendly Hinglish (Hindi + English).
-- Limit responses strictly to 1-2 concise sentences. Keep it conversational like real WhatsApp chat.
-- NEVER include formal email signatures, closings, or sign-offs (strictly NO "Regards", "Sincerely", "Xytralyn AI Assistant").
+- Limit responses strictly to 2-3 concise, complete sentences.
+- Always conclude your thought completely. Never end mid-sentence.
+- Strictly NO email sign-offs at the end of the message (do not add trailing lines like 'Regards', 'Sincerely', or signature footers).
 - CONTEXT AWARENESS: Answer specifically based on what THIS customer is asking. If they want info, explain briefly. If they ask for pricing, mention custom plans based on their scale.
 - DEMO SCHEDULING: If they mention a specific day/time, confirm THAT specific time. Do NOT assume 3:00 PM unless they explicitly said 3:00 PM. If no time is shared, ask for their convenient slot.
 - LEAD DETAILS: If the user has already shared their name, phone, or email in previous messages, NEVER ask for them again.
@@ -42,13 +43,19 @@ async def get_available_chat_models(client: AsyncGroq) -> List[str]:
         ignore_keywords = ["whisper", "vision", "guard", "arabic", "canopylabs", "compound"]
         chat_models = [m for m in active_ids if not any(k in m.lower() for k in ignore_keywords)]
         
-        preferred_order = ["openai/gpt-oss-20b", "openai/gpt-oss-120b", "qwen/qwen3.8-27b"]
+        preferred_order = [
+            "llama-3.3-70b-versatile",
+            "llama-3.1-8b-instant",
+            "mixtral-8x7b-32768",
+            "openai/gpt-oss-20b",
+            "openai/gpt-oss-120b"
+        ]
         sorted_models = [m for m in preferred_order if m in chat_models] + [m for m in chat_models if m not in preferred_order]
         
-        return sorted_models if sorted_models else ["openai/gpt-oss-20b"]
+        return sorted_models if sorted_models else ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
     except Exception as e:
         print(f"[GROQ LIST MODELS ERROR]: {e}")
-        return ["openai/gpt-oss-20b"]
+        return ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
 
 async def generate_agent_reply(user_message: str, history: Optional[List[Dict[str, str]]] = None) -> str:
     if not user_message or not user_message.strip():
@@ -58,11 +65,10 @@ async def generate_agent_reply(user_message: str, history: Optional[List[Dict[st
     if client is None:
         return "Dhanyavaad! 🙏 Hamari team aapki query check karke aapse jaldi contact karegi."
 
-    # Messages array with isolated context
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
     if history and isinstance(history, list):
-        for msg in history[-8:]:  # Last 8 messages for isolated session memory
+        for msg in history[-8:]:
             messages.append(msg)
 
     messages.append({"role": "user", "content": user_message.strip()})
@@ -75,11 +81,12 @@ async def generate_agent_reply(user_message: str, history: Optional[List[Dict[st
                 model=model_id,
                 messages=messages,
                 temperature=0.3,
-                max_tokens=220
+                max_tokens=600
             )
             reply = completion.choices[0].message.content
             if reply and reply.strip():
-                cleaned_reply = re.sub(r'(?i)\n*(regards|sincerely|best regards|xytralyn ai assistant).*', '', reply.strip()).strip()
+                # Sirf trailing newline sign-offs hatane ke liye (beech ke text ko bina kaate):
+                cleaned_reply = re.sub(r'(?i)\n+(regards|sincerely|best regards)[\s\S]*$', '', reply.strip()).strip()
                 return cleaned_reply if cleaned_reply else reply.strip()
         except Exception as e:
             print(f"[GROQ ASYNC MODEL FAILED] Model={model_id} | Error={e}")
