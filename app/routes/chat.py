@@ -17,7 +17,7 @@ WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
 WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "1359104453944965")
 
 
-def build_chat_history(db: Session, sender_phone: str, limit: int = 6):
+def build_chat_history(db: Session, sender_phone: str, limit: int = 4):
     """Database se isolated user ke recent messages nikal kar context build karta hai."""
     history = []
     try:
@@ -28,7 +28,7 @@ def build_chat_history(db: Session, sender_phone: str, limit: int = 6):
             .limit(limit)
             .all()
         )
-        records.reverse()
+        records = sorted(records, key=lambda x: x.id)
 
         for rec in records:
             if rec.content:
@@ -169,9 +169,9 @@ async def webhook_receiver(request: Request, db: Session = Depends(get_db)):
         db.commit()
         db.refresh(target_lead)
 
-    # 3. Admin notification (SIRF tabhi trigger hoga jab customer info share kare ya actual requirement/pricing puche)
-    has_contact_info = bool(extracted.get("phone") or extracted.get("email") or extracted.get("name"))
-    if has_contact_info or high_intent:
+    # 3. Admin notification (Phone/Email ya explicit high intent hone par hi send karein)
+    has_direct_contact = bool(extracted.get("phone") or extracted.get("email"))
+    if has_direct_contact or high_intent:
         try:
             send_admin_alert(
                 lead_name=getattr(target_lead, "name", "Lead Customer"),
@@ -184,16 +184,27 @@ async def webhook_receiver(request: Request, db: Session = Depends(get_db)):
     else:
         print(f"[CASUAL MESSAGE]: '{user_message}' - Admin alert skipped.")
 
-    # 4. Conversation context
-    chat_history = build_chat_history(db, sender_phone, limit=6)
+    # 4. Direct Clean Responses for Greetings & General Inquiries
+    clean_text = user_message.lower().strip()
+    casual_greetings = {"hi", "hello", "hey", "hii", "hiii", "namaste", "hlo", "yo"}
+    agency_info_triggers = {
+        "apni details batao", "details batao", "who are you",
+        "kya karte ho", "about you", "about xytralyn", "details"
+    }
 
-    # 5. AI Reply generation
-    try:
-        ai_response = await generate_agent_reply(user_message, history=chat_history)
-    except Exception as agent_err:
-        print(f"[AI AGENT ERROR]: {agent_err}")
-        c_name = target_lead.company if target_lead.company and target_lead.company != "N/A" else "Customer"
-        ai_response = f"Dhanyavaad, {c_name}! Aapka message mil gaya hai. Hum jaldi contact karenge."
+    if clean_text in casual_greetings:
+        ai_response = "Hey! 👋 Xytralyn AI me aapka swagat hai. Hum business ke liye smart AI & WhatsApp automation banate hain. Aaj aapki kya help kar sakta hoon?"
+    elif any(trigger in clean_text for trigger in agency_info_triggers):
+        ai_response = "Xytralyn ek Multi-Agent AI SaaS agency hai jo customer support, sales aur WhatsApp automation provide karti hai. Humare plans ₹2,499/month se start hote hain. Aap apne business ke liye kis feature me interested hain?"
+    else:
+        # 5. AI Reply generation (Recent 4 messages isolated)
+        chat_history = build_chat_history(db, sender_phone, limit=4)
+        try:
+            ai_response = await generate_agent_reply(user_message, history=chat_history)
+        except Exception as agent_err:
+            print(f"[AI AGENT ERROR]: {agent_err}")
+            c_name = target_lead.company if target_lead.company and target_lead.company != "N/A" else "Customer"
+            ai_response = f"Dhanyavaad, {c_name}! Aapka message mil gaya hai. Hum jaldi contact karenge."
 
     # 6. Save message record
     try:
@@ -245,9 +256,8 @@ async def handle_green_api(data: dict, db: Session):
         db.commit()
         db.refresh(target_lead)
 
-    # Green-API ke liye bhi check
-    has_contact_info = bool(extracted.get("phone") or extracted.get("email") or extracted.get("name"))
-    if has_contact_info or high_intent:
+    has_direct_contact = bool(extracted.get("phone") or extracted.get("email"))
+    if has_direct_contact or high_intent:
         try:
             send_admin_alert(
                 lead_name=getattr(target_lead, "name", "Lead Customer"),
@@ -257,11 +267,15 @@ async def handle_green_api(data: dict, db: Session):
         except Exception:
             pass
 
-    chat_history = build_chat_history(db, sender_phone, limit=6)
-    try:
-        ai_response = await generate_agent_reply(user_message, history=chat_history)
-    except Exception:
-        ai_response = "Aapka message mil gaya hai."
+    clean_text = user_message.lower().strip()
+    if clean_text in {"hi", "hello", "hey", "hii", "namaste"}:
+        ai_response = "Hey! 👋 Xytralyn AI me aapka swagat hai. Aaj aapki kya help kar sakta hoon?"
+    else:
+        chat_history = build_chat_history(db, sender_phone, limit=4)
+        try:
+            ai_response = await generate_agent_reply(user_message, history=chat_history)
+        except Exception:
+            ai_response = "Aapka message mil gaya hai."
 
     inst_id = os.getenv("GREEN_API_INSTANCE_ID")
     tok = os.getenv("GREEN_API_TOKEN")
@@ -303,9 +317,8 @@ async def incoming_chat(
         db.commit()
         db.refresh(target_lead)
 
-    # Twilio alerts filter
-    has_contact_info = bool(extracted.get("phone") or extracted.get("email") or extracted.get("name"))
-    if has_contact_info or high_intent:
+    has_direct_contact = bool(extracted.get("phone") or extracted.get("email"))
+    if has_direct_contact or high_intent:
         try:
             send_admin_alert(
                 lead_name=getattr(target_lead, "name", "Lead Customer"),
@@ -315,7 +328,7 @@ async def incoming_chat(
         except Exception:
             pass
 
-    chat_history = build_chat_history(db, sender_phone, limit=6)
+    chat_history = build_chat_history(db, sender_phone, limit=4)
     try:
         ai_response = await generate_agent_reply(user_message, history=chat_history)
     except Exception:
