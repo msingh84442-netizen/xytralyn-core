@@ -10,15 +10,17 @@ from fastapi import (
     Request,
     Query,
     HTTPException,
+    BackgroundTasks,
 )
 from sqlalchemy.orm import Session
 from twilio.twiml.messaging_response import MessagingResponse
 
-from app.database import get_db
+from app.database import get_db, SessionLocal
 from app.models import Lead, Message
 from app.services.ai_agent import (
     extract_lead_info,
     is_potential_lead,
+    detect_agent,
     generate_agent_reply,
 )
 from app.services.notifier import send_admin_alert
@@ -27,6 +29,7 @@ from app.services.notifier import send_admin_alert
 router = APIRouter(tags=["Chat"])
 
 logger = logging.getLogger(__name__)
+
 
 VERIFY_TOKEN = os.getenv(
     "WHATSAPP_VERIFY_TOKEN",
@@ -46,7 +49,7 @@ def build_chat_history(
     sender_phone: str,
     limit: int = 6,
 ) -> List[Dict[str, str]]:
-    history = []
+    history: List[Dict[str, str]] = []
 
     try:
         records = (
@@ -155,10 +158,12 @@ def parse_meta_message(data: Dict[str, Any]):
 
         elif message_type == "interactive":
             interactive = first_message.get("interactive", {})
+
             if "button_reply" in interactive:
                 user_message = str(
                     interactive["button_reply"].get("title", "")
                 ).strip()
+
             elif "list_reply" in interactive:
                 user_message = str(
                     interactive["list_reply"].get("title", "")
@@ -202,12 +207,13 @@ def save_message(
     sender_phone: str,
     user_message: str,
     ai_response: str,
+    agent_used: str,
 ):
     try:
         record = Message(
             sender_phone=sender_phone,
             content=user_message,
-            agent_used="dynamic-ai-agent",
+            agent_used=agent_used,
         )
 
         if hasattr(record, "agent_reply"):
@@ -221,46 +227,71 @@ def save_message(
         logger.exception("Could not save message")
 
 
-async def process_message(
-    db: Session,
-    sender_phone: str,
-    user_message: str,
-) -> str:
-    if not sender_phone or not user_message:
-        return ""
-
-    extracted = extract_lead_info(user_message)
-    high_intent = is_potential_lead(user_message)
-
-    lead = None
+async def handle_async_meta_message(sender_phone: str, user_message: str):
+    db: Session = SessionLocal()
     try:
-        lead = update_or_create_lead(db, sender_phone, extracted)
-    except Exception:
-        db.rollback()
-        logger.exception("Lead processing failed")
+        selected_agent = detect_agent(user_message)
+        extracted = extract_lead_info(user_message)
+        high_intent = is_potential_lead(user_message)
 
-    has_contact = bool(extracted.get("phone") or extracted.get("email"))
+        lead = None
+        if selected_agent == "sales" or high_intent:
+            try:
+                lead = update_or_create_lead(
+                    db=db,
+                    sender_phone=sender_phone,
+                    extracted=extracted,
+                )
+            except Exception:
+                db.rollback()
+                logger.exception("Lead processing failed")
 
-    if has_contact or high_intent:
+        has_contact = bool(extracted.get("phone") or extracted.get("email"))
+
+        if selected_agent == "sales" and (has_contact or high_intent):
+            try:
+                send_admin_alert(
+                    lead_name=getattr(lead, "name", "Lead Customer"),
+                    company=getattr(lead, "company", "N/A"),
+                    phone=sender_phone,
+                )
+            except Exception:
+                logger.exception("Admin notification failed")
+
+        history = build_chat_history(
+            db=db,
+            sender_phone=sender_phone,
+            limit=6,
+        )
+
         try:
-            send_admin_alert(
-                lead_name=getattr(lead, "name", "Lead Customer"),
-                company=getattr(lead, "company", "N/A"),
-                phone=sender_phone,
+            ai_response = await generate_agent_reply(
+                user_message=user_message,
+                history=history,
+                agent_name=selected_agent,
+                business_name="AstaLynx",
             )
         except Exception:
-            logger.exception("Admin notification failed")
+            logger.exception("AI generation failed")
+            ai_response = (
+                "Mujhe is waqt response generate karne mein temporary issue aa raha hai. "
+                "Kripya ek pal baad dobara try karein."
+            )
 
-    history = build_chat_history(db, sender_phone, limit=6)
+        save_message(
+            db=db,
+            sender_phone=sender_phone,
+            user_message=user_message,
+            ai_response=ai_response,
+            agent_used=selected_agent,
+        )
 
-    try:
-        ai_response = await generate_agent_reply(user_message, history)
-    except Exception:
-        logger.exception("AI generation failed")
-        ai_response = "Mujhe is waqt response generate karne mein temporary issue aa raha hai. Kripya ek pal baad dobara try karein."
-
-    save_message(db, sender_phone, user_message, ai_response)
-    return ai_response
+        send_meta_whatsapp_message(
+            to_phone=sender_phone,
+            message_text=ai_response,
+        )
+    finally:
+        db.close()
 
 
 @router.get("/webhook")
@@ -273,7 +304,10 @@ async def verify_webhook(
     expected_token = os.getenv("WHATSAPP_VERIFY_TOKEN", VERIFY_TOKEN)
 
     if hub_mode == "subscribe" and hub_verify_token == expected_token:
-        return Response(content=hub_challenge or "", media_type="text/plain")
+        return Response(
+            content=hub_challenge or "",
+            media_type="text/plain",
+        )
 
     raise HTTPException(
         status_code=403,
@@ -285,7 +319,7 @@ async def verify_webhook(
 @router.post("/chat/webhook")
 async def webhook_receiver(
     request: Request,
-    db: Session = Depends(get_db),
+    background_tasks: BackgroundTasks,
 ):
     try:
         data = await request.json()
@@ -296,12 +330,17 @@ async def webhook_receiver(
     sender_phone, user_message = parse_meta_message(data)
 
     if not sender_phone or not user_message:
-        return {"status": "ok", "reason": "no_message"}
+        return {
+            "status": "ok",
+            "reason": "no_message",
+        }
 
-    ai_response = await process_message(db, sender_phone, user_message)
-
-    if ai_response:
-        send_meta_whatsapp_message(sender_phone, ai_response)
+    # Meta webhook timeout aur 3x message loop avoid karne ke liye background task
+    background_tasks.add_task(
+        handle_async_meta_message,
+        sender_phone,
+        user_message,
+    )
 
     return {"status": "success"}
 
@@ -313,10 +352,42 @@ async def incoming_chat(
     db: Session = Depends(get_db),
 ):
     form_data = await request.form()
-    sender_phone = str(form_data.get("From", "")).replace("whatsapp:", "").strip()
-    user_message = str(form_data.get("Body", "")).strip()
 
-    ai_response = await process_message(db, sender_phone, user_message)
+    sender_phone = str(
+        form_data.get("From", "")
+    ).replace("whatsapp:", "").strip()
+
+    user_message = str(
+        form_data.get("Body", "")
+    ).strip()
+
+    selected_agent = detect_agent(user_message)
+    history = build_chat_history(
+        db=db,
+        sender_phone=sender_phone,
+        limit=6,
+    )
+
+    try:
+        ai_response = await generate_agent_reply(
+            user_message=user_message,
+            history=history,
+            agent_name=selected_agent,
+            business_name="AstaLynx",
+        )
+    except Exception:
+        ai_response = (
+            "Mujhe is waqt response generate karne mein temporary issue aa raha hai. "
+            "Kripya ek pal baad dobara try karein."
+        )
+
+    save_message(
+        db=db,
+        sender_phone=sender_phone,
+        user_message=user_message,
+        ai_response=ai_response,
+        agent_used=selected_agent,
+    )
 
     twilio_response = MessagingResponse()
     twilio_response.message(str(ai_response))
