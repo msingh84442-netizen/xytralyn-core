@@ -199,12 +199,12 @@ async def webhook_receiver(request: Request, db: Session = Depends(get_db)):
 @router.post("/incoming")
 @router.post("/chat/incoming")
 async def incoming_chat(
-    From: str = Form(...),
-    Body: str = Form(...),
+    request: Request,
     db: Session = Depends(get_db)
 ):
-    sender_phone = From.replace("whatsapp:", "").strip()
-    user_message = Body.strip()
+    form_data = await request.form()
+    sender_phone = str(form_data.get("From", "")).replace("whatsapp:", "").strip()
+    user_message = str(form_data.get("Body", "")).strip()
 
     chat_history = build_chat_history(db, sender_phone, limit=4)
     ai_response = await generate_agent_reply(user_message, history=chat_history)
