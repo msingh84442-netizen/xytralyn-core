@@ -8,23 +8,22 @@ from dotenv import load_dotenv
 load_dotenv()
 
 SYSTEM_PROMPT = """
-You are the official AI Assistant for Xytralyn chatting on WhatsApp.
+You are the official AI Assistant for Xytralyn on WhatsApp.
 
 About Xytralyn:
-We provide Multi-Agent AI SaaS & business automation (Sales, Support, HR, Accountant, Research agents) and WhatsApp automation for businesses.
+We provide Multi-Agent AI SaaS & business automation (Sales, Support, HR, Accountant, Research) and WhatsApp automation for businesses.
 
-Official Pricing Structure:
-- Starter: ₹2,499/month (1 AI Agent + WhatsApp integration)
-- Growth: ₹4,999/month (Up to 3 AI Agents + CRM)
-- Enterprise: ₹9,999/month (Full custom automation)
+Official Plans:
+- Starter: ₹2,499/month
+- Growth: ₹4,999/month
+- Enterprise: ₹9,999/month
 
-Strict WhatsApp Guidelines:
-- Reply in natural, friendly Hinglish (Hindi + English).
-- Limit responses strictly to 1-3 complete sentences.
-- DIVERSITY & NATURAL TONE: DO NOT start every message with "Sure!" or "Sure! Our pricing". Reply like a real human.
-- GREETING RESET: If the user says "Hi", "Hello", or "Apni details batao", greet them warmly and introduce Xytralyn's services fresh. Do NOT cling to older topics (like store pricing) unless the user brings it up again.
-- PRICING: If asked about price, mention the starting range (₹2,499/mo) and customize from there. Never use dummy placeholders like ₹X.
-- Strictly NO email signatures or footers.
+Strict Guidelines:
+1. FOCUS ONLY ON THE LATEST MESSAGE: Never bring up older topics (like stores, quotes, or pricing) unless the user's latest message specifically asks about them.
+2. BREVITY: Keep answers strictly under 2 concise sentences.
+3. CONVERSATIONAL: Speak in natural, friendly Hinglish.
+4. NO DUMMY VALUES: Always use exact pricing (₹2,499/mo, etc.). Never use placeholders like ₹X or [price].
+5. NO SIGN-OFFS: Strictly NO email footers, sign-offs, or signatures (never write 'Regards', 'Sincerely', or 'Xytralyn AI Assistant' at the end).
 """
 
 def get_async_groq_client() -> Optional[AsyncGroq]:
@@ -39,31 +38,30 @@ def get_async_groq_client() -> Optional[AsyncGroq]:
         return None
 
 async def get_available_chat_models(client: AsyncGroq) -> List[str]:
-    """Dynamically fetch and prioritize active general chat models asynchronously."""
+    """Dynamically fetch and prioritize active production chat models."""
+    fallback_models = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
     try:
         models_data = await client.models.list()
         active_ids = [m.id for m in models_data.data if getattr(m, 'active', True)]
         
-        ignore_keywords = ["whisper", "vision", "guard", "arabic", "canopylabs", "compound"]
+        ignore_keywords = ["whisper", "vision", "guard", "audio", "embed"]
         chat_models = [m for m in active_ids if not any(k in m.lower() for k in ignore_keywords)]
         
         preferred_order = [
             "llama-3.3-70b-versatile",
             "llama-3.1-8b-instant",
-            "mixtral-8x7b-32768",
-            "openai/gpt-oss-20b",
-            "openai/gpt-oss-120b"
+            "llama-3.1-70b-versatile",
+            "mixtral-8x7b-32768"
         ]
         sorted_models = [m for m in preferred_order if m in chat_models] + [m for m in chat_models if m not in preferred_order]
-        
-        return sorted_models if sorted_models else ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
+        return sorted_models if sorted_models else fallback_models
     except Exception as e:
         print(f"[GROQ LIST MODELS ERROR]: {e}")
-        return ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
+        return fallback_models
 
 async def generate_agent_reply(user_message: str, history: Optional[List[Dict[str, str]]] = None) -> str:
     if not user_message or not user_message.strip():
-        return "Namaste! 👋 Main Xytralyn AI assistant hoon. Aapki kya sahayata kar sakta hoon?"
+        return "Namaste! 👋 Main Xytralyn AI assistant hoon. Aaj aapki kya sahayata kar sakta hoon?"
 
     client = get_async_groq_client()
     if client is None:
@@ -71,8 +69,9 @@ async def generate_agent_reply(user_message: str, history: Optional[List[Dict[st
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
+    # Only include recent context to avoid topic lock
     if history and isinstance(history, list):
-        for msg in history[-8:]:
+        for msg in history[-4:]:
             messages.append(msg)
 
     messages.append({"role": "user", "content": user_message.strip()})
@@ -89,8 +88,8 @@ async def generate_agent_reply(user_message: str, history: Optional[List[Dict[st
             )
             reply = completion.choices[0].message.content
             if reply and reply.strip():
-                # Sirf trailing newline sign-offs hatane ke liye (beech ke text ko bina kaate):
-                cleaned_reply = re.sub(r'(?i)\n+(regards|sincerely|best regards)[\s\S]*$', '', reply.strip()).strip()
+                # Strip trailing sign-offs without cutting genuine body sentences
+                cleaned_reply = re.sub(r'(?i)\n+(regards|sincerely|best regards|thanks & regards)[\s\S]*$', '', reply.strip()).strip()
                 return cleaned_reply if cleaned_reply else reply.strip()
         except Exception as e:
             print(f"[GROQ ASYNC MODEL FAILED] Model={model_id} | Error={e}")
@@ -141,14 +140,14 @@ def is_potential_lead(user_message: str) -> bool:
         return False
     text = user_message.lower().strip()
     
-    # Casual greetings ko ignore karein
-    greetings = ["hi", "hello", "hey", "namaste", "hlo", "hii", "hiii"]
+    # Ignore purely casual greetings or single-word texts
+    greetings = {"hi", "hello", "hey", "namaste", "hlo", "hii", "hiii", "yo", "kya haal hai"}
     if text in greetings:
         return False
 
     lead_keywords = [
         "price", "pricing", "cost", "demo", "interested", "buy",
         "purchase", "service", "automation", "whatsapp bot", "ai agent",
-        "website", "web development", "need", "requirement", "business"
+        "website", "web development", "need", "requirement", "quotation"
     ]
-    return any(keyword in text for keyword in lead_keywords)
+    return any(re.search(rf"\b{re.escape(keyword)}\b", text) for keyword in lead_keywords)
