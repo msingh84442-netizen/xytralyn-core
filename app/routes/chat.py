@@ -17,7 +17,7 @@ WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "13591044539449
 
 
 def build_chat_history(db: Session, sender_phone: str, limit: int = 4):
-    """Client ke recent messages fetch karta hai taaki zaroorat padne par continuity bani rahe."""
+    """Client ke recent messages fetch karta hai taaki conversation smooth rahe."""
     history = []
     try:
         records = (
@@ -152,7 +152,7 @@ async def webhook_receiver(request: Request, db: Session = Depends(get_db)):
         db.commit()
         db.refresh(target_lead)
 
-    # 3. Admin Notification (Sirf phone/email aane par ya actual requirement poochne par)
+    # 3. Admin Notification (Sirf phone/email aane par ya actual commercial requirement poochne par)
     has_contact = bool(extracted.get("phone") or extracted.get("email"))
     if has_contact or high_intent:
         try:
@@ -170,7 +170,7 @@ async def webhook_receiver(request: Request, db: Session = Depends(get_db)):
     try:
         ai_response = await generate_agent_reply(user_message, history=chat_history)
     except Exception as agent_err:
-        print(f"[AI AGENT ERROR]: {agent_err}")
+        print(f"\033[91m[AI AGENT ERROR]:\033[0m {agent_err}")
         ai_response = "Hey! 👋 Xytralyn me aapka swagat hai. Aaj main aapki kya madad kar sakta hoon?"
 
     # 5. Message record save
@@ -187,14 +187,14 @@ async def webhook_receiver(request: Request, db: Session = Depends(get_db)):
     except Exception as db_err:
         print(f"[DB RECORD SAVE ERROR]: {db_err}")
 
-    # 6. Response dispatch
+    # 6. Response dispatch to WhatsApp
     send_meta_whatsapp_message(to_phone=sender_phone, message_text=ai_response)
 
     return {"status": "success"}
 
 
 # ==========================================
-# 3. TWILIO COMPATIBILITY
+# 3. TWILIO COMPATIBILITY (Form dependency free)
 # ==========================================
 @router.post("/incoming")
 @router.post("/chat/incoming")
