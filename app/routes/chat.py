@@ -1,429 +1,477 @@
+# ============================================================
+# CHAT ROUTE - PART 1
+# Imports + Constants
+# ============================================================
+
 import os
 import logging
-from typing import List, Dict, Any, Optional, Tuple
+from typing import Optional, Dict, Any, List
 
-import requests
-from fastapi import (
-    APIRouter,
-    Depends,
-    Response,
-    Request,
-    Query,
-    HTTPException,
-    BackgroundTasks,
-)
-from sqlalchemy.orm import Session
-from twilio.twiml.messaging_response import MessagingResponse
+import httpx
+from fastapi import APIRouter, Request
+from fastapi.responses import PlainTextResponse
 
-from app.database import get_db, SessionLocal
+from app.database import SessionLocal
 from app.models import Lead, Message
+
 from app.services.ai_agent import (
-    extract_lead_info,
-    is_potential_lead,
     detect_agent,
+    extract_lead_info,
     generate_agent_reply,
+    is_potential_lead,
+    normalize_history,
+    merge_customer_memory,
+    memory_to_text,
 )
-from app.services.notifier import send_admin_alert
-
-
-router = APIRouter(tags=["Chat"])
 
 logger = logging.getLogger(__name__)
 
+router = APIRouter()
+
 
 # ============================================================
-# CONFIGURATION
+# BUSINESS CONFIG
 # ============================================================
-
-VERIFY_TOKEN = os.getenv(
-    "WHATSAPP_VERIFY_TOKEN",
-    "xytralyn_secret_verify_token_2026",
-)
-
-WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
-
-WHATSAPP_PHONE_NUMBER_ID = os.getenv(
-    "WHATSAPP_PHONE_NUMBER_ID",
-    "1359104453944965",
-)
 
 BUSINESS_NAME = "Xytralyn"
 
-# More conversation context.
 HISTORY_LIMIT = 20
 
 
 # ============================================================
-# CHAT HISTORY
+# META WHATSAPP CONFIG
+# ============================================================
+
+META_ACCESS_TOKEN = os.getenv(
+    "META_ACCESS_TOKEN"
+)
+
+META_PHONE_NUMBER_ID = os.getenv(
+    "META_PHONE_NUMBER_ID"
+)
+
+META_VERIFY_TOKEN = os.getenv(
+    "META_VERIFY_TOKEN"
+)
+
+
+# ============================================================
+# TWILIO CONFIG
+# ============================================================
+
+TWILIO_ACCOUNT_SID = os.getenv(
+    "TWILIO_ACCOUNT_SID"
+)
+
+TWILIO_AUTH_TOKEN = os.getenv(
+    "TWILIO_AUTH_TOKEN"
+)
+
+TWILIO_WHATSAPP_FROM = os.getenv(
+    "TWILIO_WHATSAPP_FROM"
+)
+
+
+# ============================================================
+# CUSTOMER MEMORY
+# ============================================================
+
+# Temporary in-process memory.
+#
+# Key:
+#     customer phone number
+#
+# Value:
+#     structured customer profile
+#
+# IMPORTANT:
+# This is customer-specific.
+# Customer A's memory will never be used for Customer B.
+#
+# Later we can move this to PostgreSQL/Redis for production.
+#
+CUSTOMER_MEMORY: Dict[str, Dict[str, Any]] = {}
+
+
+def get_customer_memory(
+    phone: str,
+) -> Dict[str, Any]:
+    """
+    Get memory for ONE customer only.
+    """
+
+    if not phone:
+        return {}
+
+    return CUSTOMER_MEMORY.get(
+        phone,
+        {},
+    ).copy()
+
+
+def update_customer_memory(
+    phone: str,
+    new_data: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """
+    Merge latest customer information into
+    this customer's existing memory.
+    """
+
+    if not phone:
+        return {}
+
+    old_memory = get_customer_memory(
+        phone
+    )
+
+    updated_memory = merge_customer_memory(
+        old_memory,
+        new_data or {},
+    )
+
+    CUSTOMER_MEMORY[phone] = (
+        updated_memory
+    )
+
+    return updated_memory
+# ============================================================
+# CHAT HISTORY + CUSTOMER MEMORY - PART 2
 # ============================================================
 
 def build_chat_history(
-    db: Session,
+    db,
     sender_phone: str,
     limit: int = HISTORY_LIMIT,
 ) -> List[Dict[str, str]]:
     """
-    Build conversation history for ONE WhatsApp customer.
+    Build recent conversation history for ONE customer.
 
-    Important:
-    - sender_phone isolates one customer's conversation.
-    - We retrieve more records so older context is not lost.
-    - Database order is restored before sending to the AI.
+    Only this phone number's messages are loaded.
     """
 
-    history: List[Dict[str, str]] = []
+    if not sender_phone:
+        return []
 
-    try:
-        records = (
-            db.query(Message)
-            .filter(
-                Message.sender_phone == sender_phone
-            )
-            .order_by(Message.id.desc())
-            .limit(limit)
-            .all()
+    messages = (
+        db.query(Message)
+        .filter(
+            Message.sender_phone
+            == sender_phone
+        )
+        .order_by(
+            Message.timestamp.desc()
+        )
+        .limit(limit)
+        .all()
+    )
+
+    messages.reverse()
+
+    history = []
+
+    for message in messages:
+
+        content = getattr(
+            message,
+            "content",
+            None,
         )
 
-        records = list(reversed(records))
-
-        for record in records:
-
-            user_message = getattr(
-                record,
-                "content",
-                None,
-            )
-
-            agent_reply = getattr(
-                record,
-                "agent_reply",
-                None,
-            )
-
-            if user_message:
-                history.append(
-                    {
-                        "role": "user",
-                        "content": str(
-                            user_message
-                        ).strip(),
-                    }
-                )
-
-            if agent_reply:
-                history.append(
-                    {
-                        "role": "assistant",
-                        "content": str(
-                            agent_reply
-                        ).strip(),
-                    }
-                )
-
-    except Exception:
-        logger.exception(
-            "Could not fetch chat history for %s",
-            sender_phone,
-        )
-
-    return history
-
-
-# ============================================================
-# CUSTOMER PROFILE FROM HISTORY
-# ============================================================
-
-def build_customer_profile(
-    history: List[Dict[str, str]],
-    current_message: str,
-) -> Dict[str, Optional[str]]:
-    """
-    Reconstruct customer information from the conversation.
-
-    This is deliberately done outside the LLM so the AI does not
-    have to guess the customer's identity/details.
-    """
-
-    profile: Dict[str, Optional[str]] = {
-        "name": None,
-        "phone": None,
-        "email": None,
-        "company": None,
-        "business_type": None,
-    }
-
-    all_user_messages: List[str] = []
-
-    for item in history:
-
-        if (
-            isinstance(item, dict)
-            and item.get("role") == "user"
-            and isinstance(item.get("content"), str)
-        ):
-            all_user_messages.append(
-                item["content"]
-            )
-
-    if current_message:
-        all_user_messages.append(
-            current_message
-        )
-
-    # --------------------------------------------------------
-    # Extract cumulative contact information
-    # --------------------------------------------------------
-
-    for message in all_user_messages:
-
-        try:
-            extracted = extract_lead_info(
-                message
-            )
-        except Exception:
-            logger.exception(
-                "Lead extraction failed"
-            )
+        if not content:
             continue
 
-        if extracted.get("name"):
-            profile["name"] = extracted["name"]
+        # ----------------------------------------------------
+        # Determine message role
+        # ----------------------------------------------------
 
-        if extracted.get("phone"):
-            profile["phone"] = extracted["phone"]
-
-        if extracted.get("email"):
-            profile["email"] = extracted["email"]
-
-        if extracted.get("company"):
-            profile["company"] = extracted["company"]
-
-    # --------------------------------------------------------
-    # Business type
-    #
-    # We intentionally look from newest message backwards.
-    # Latest customer statement gets priority.
-    # --------------------------------------------------------
-
-    business_patterns = [
-        (
-            "real estate",
-            [
-                "real estate",
-                "real-estate",
-                "property dealer",
-                "property business",
-            ],
-        ),
-        (
-            "coaching",
-            [
-                "coaching centre",
-                "coaching center",
-                "coaching",
-                "tuition centre",
-                "tuition center",
-            ],
-        ),
-        (
-            "clinic",
-            [
-                "clinic",
-            ],
-        ),
-        (
-            "hospital",
-            [
-                "hospital",
-            ],
-        ),
-        (
-            "school",
-            [
-                "school",
-            ],
-        ),
-        (
-            "restaurant",
-            [
-                "restaurant",
-                "cafe",
-                "café",
-            ],
-        ),
-        (
-            "salon",
-            [
-                "salon",
-                "beauty parlour",
-                "beauty parlor",
-            ],
-        ),
-        (
-            "ecommerce",
-            [
-                "ecommerce",
-                "e-commerce",
-                "online store",
-            ],
-        ),
-        (
-            "consultant",
-            [
-                "consultant",
-                "consulting",
-            ],
-        ),
-        (
-            "insurance",
-            [
-                "insurance",
-            ],
-        ),
-        (
-            "travel agency",
-            [
-                "travel agency",
-                "tour agency",
-            ],
-        ),
-        (
-            "car dealer",
-            [
-                "car dealer",
-                "automobile dealer",
-            ],
-        ),
-        (
-            "gym",
-            [
-                "gym",
-                "fitness centre",
-                "fitness center",
-            ],
-        ),
-    ]
-
-    latest_position = -1
-    latest_business = None
-
-    complete_text = "\n".join(
-        all_user_messages
-    ).lower()
-
-    for business_name, phrases in business_patterns:
-
-        for phrase in phrases:
-
-            position = complete_text.rfind(
-                phrase
-            )
-
-            if position > latest_position:
-                latest_position = position
-                latest_business = business_name
-
-    if latest_business:
-        profile["business_type"] = (
-            latest_business
+        sender_type = getattr(
+            message,
+            "sender_type",
+            None,
         )
 
-    return profile
+        if sender_type == "assistant":
+            role = "assistant"
 
+        elif sender_type == "user":
+            role = "user"
 
-# ============================================================
-# CUSTOMER PROFILE INSTRUCTION
-# ============================================================
+        else:
+            # Existing database schema may not have
+            # sender_type. In that case use a safe fallback.
+            role = "user"
 
-def build_profile_instruction(
-    profile: Dict[str, Optional[str]],
-) -> str:
-
-    lines = [
-        "CUSTOMER PROFILE:",
-        "These are facts collected from this customer's own conversation.",
-        "Treat them as known facts.",
-        "Never invent or change them.",
-    ]
-
-    if profile.get("name"):
-        lines.append(
-            f"Customer name: {profile['name']}"
+        history.append(
+            {
+                "role": role,
+                "content": str(content).strip(),
+            }
         )
 
-    if profile.get("phone"):
-        lines.append(
-            f"Customer phone: {profile['phone']}"
-        )
-
-    if profile.get("email"):
-        lines.append(
-            f"Customer email: {profile['email']}"
-        )
-
-    if profile.get("company"):
-        lines.append(
-            f"Company: {profile['company']}"
-        )
-
-    if profile.get("business_type"):
-        lines.append(
-            f"Business type: {profile['business_type']}"
-        )
-
-    lines.extend(
-        [
-            "",
-            "MEMORY RULES:",
-            "1. Do not ask again for information already present here.",
-            "2. If the customer asks for their name, email, phone, or business, answer from this profile.",
-            "3. Never replace a known customer fact with a guess.",
-            "4. The latest explicit customer statement has priority.",
-            "5. Do not confuse this customer with another WhatsApp number.",
-        ]
+    return normalize_history(
+        history
     )
 
-    return "\n".join(lines)
+
+def process_customer_memory(
+    sender_phone: str,
+    user_message: str,
+) -> Dict[str, Any]:
+    """
+    Extract information ONLY from the current
+    customer message and merge it into that customer's
+    existing memory.
+    """
+
+    if not sender_phone:
+        return {}
+
+    if not user_message:
+        return get_customer_memory(
+            sender_phone
+        )
+
+    # --------------------------------------------------------
+    # Extract ONLY from customer message
+    # --------------------------------------------------------
+
+    new_data = extract_lead_info(
+        user_message
+    )
+
+    # --------------------------------------------------------
+    # Extract demo information
+    # --------------------------------------------------------
+
+    from app.services.ai_agent import (
+        extract_demo_datetime,
+    )
+
+    (
+        demo_date,
+        demo_time,
+        demo_datetime,
+    ) = extract_demo_datetime(
+        user_message
+    )
+
+    if demo_date:
+        new_data["demo_date"] = (
+            demo_date
+        )
+
+    if demo_time:
+        new_data["demo_time"] = (
+            demo_time
+        )
+
+    if demo_datetime:
+        new_data["demo_datetime"] = (
+            demo_datetime
+        )
+
+    # --------------------------------------------------------
+    # Merge with existing customer memory
+    # --------------------------------------------------------
+
+    return update_customer_memory(
+        sender_phone,
+        new_data,
+    )
+
+
+def get_customer_context(
+    sender_phone: str,
+) -> str:
+    """
+    Return compact confirmed customer context
+    for the AI agent.
+    """
+
+    memory = get_customer_memory(
+        sender_phone
+    )
+
+    return memory_to_text(
+        memory
+    )
 # ============================================================
-# WHATSAPP SENDING
+# LEAD + MESSAGE DATABASE HELPERS - PART 3
 # ============================================================
 
-def send_meta_whatsapp_message(
-    to_phone: str,
+def update_or_create_lead(
+    db,
+    sender_phone: str,
+    lead_data: Optional[Dict[str, Any]],
+) -> Optional[Lead]:
+    """
+    Create or update a lead using the customer's phone number.
+    """
+
+    if not sender_phone:
+        return None
+
+    if not lead_data:
+        return None
+
+    # --------------------------------------------------------
+    # Find existing lead
+    # --------------------------------------------------------
+
+    lead = (
+        db.query(Lead)
+        .filter(
+            Lead.phone
+            == sender_phone
+        )
+        .first()
+    )
+
+    # --------------------------------------------------------
+    # Create new lead
+    # --------------------------------------------------------
+
+    if not lead:
+
+        lead = Lead(
+            phone=sender_phone,
+            name=lead_data.get(
+                "name"
+            ),
+            email=lead_data.get(
+                "email"
+            ),
+            company=lead_data.get(
+                "company"
+            ),
+            status="new",
+            source="whatsapp",
+        )
+
+        db.add(lead)
+
+    else:
+
+        # ----------------------------------------------------
+        # Update ONLY fields actually provided
+        # by the customer.
+        # ----------------------------------------------------
+
+        if lead_data.get("name"):
+            lead.name = lead_data[
+                "name"
+            ]
+
+        if lead_data.get("email"):
+            lead.email = lead_data[
+                "email"
+            ]
+
+        if lead_data.get("company"):
+            lead.company = lead_data[
+                "company"
+            ]
+
+    db.commit()
+    db.refresh(lead)
+
+    return lead
+
+
+def save_message(
+    db,
+    sender_phone: str,
+    content: str,
+    agent_name: Optional[str] = None,
+    sender_type: str = "user",
+):
+    """
+    Save one message.
+
+    sender_type:
+        user      -> customer message
+        assistant -> AI response
+    """
+
+    if not sender_phone:
+        return None
+
+    if not content:
+        return None
+
+    message = Message(
+        sender_phone=sender_phone,
+        content=content,
+        agent_used=agent_name,
+    )
+
+    # --------------------------------------------------------
+    # If your Message model contains sender_type,
+    # save it.
+    #
+    # getattr is used so the code doesn't crash if the
+    # existing SQLAlchemy model does not yet have this field.
+    # --------------------------------------------------------
+
+    if hasattr(
+        message,
+        "sender_type",
+    ):
+        message.sender_type = (
+            sender_type
+        )
+
+    db.add(message)
+    db.commit()
+    db.refresh(message)
+
+    return message
+# ============================================================
+# META WHATSAPP HELPERS - PART 4
+# ============================================================
+
+async def send_meta_whatsapp_message(
+    recipient_phone: str,
     message_text: str,
 ) -> bool:
+    """
+    Send a WhatsApp message through Meta Cloud API.
+    """
 
-    token = (
-        os.getenv("WHATSAPP_TOKEN")
-        or WHATSAPP_TOKEN
-    )
-
-    phone_id = (
-        os.getenv(
-            "WHATSAPP_PHONE_NUMBER_ID"
-        )
-        or WHATSAPP_PHONE_NUMBER_ID
-    )
-
-    if not token or not phone_id:
+    if not META_ACCESS_TOKEN:
         logger.error(
-            "WhatsApp token or phone ID is missing"
+            "META_ACCESS_TOKEN is missing."
         )
         return False
 
+    if not META_PHONE_NUMBER_ID:
+        logger.error(
+            "META_PHONE_NUMBER_ID is missing."
+        )
+        return False
+
+    if not recipient_phone:
+        return False
+
+    if not message_text:
+        return False
+
     url = (
-        f"https://graph.facebook.com/"
-        f"v21.0/{phone_id}/messages"
+        "https://graph.facebook.com/v23.0/"
+        f"{META_PHONE_NUMBER_ID}/messages"
     )
 
     headers = {
-        "Authorization": f"Bearer {token}",
+        "Authorization": (
+            f"Bearer {META_ACCESS_TOKEN}"
+        ),
         "Content-Type": "application/json",
     }
 
     payload = {
         "messaging_product": "whatsapp",
-        "to": to_phone,
+        "to": recipient_phone,
         "type": "text",
         "text": {
             "body": message_text,
@@ -432,59 +480,60 @@ def send_meta_whatsapp_message(
 
     try:
 
-        result = requests.post(
-            url,
-            json=payload,
-            headers=headers,
-            timeout=15,
-        )
+        async with httpx.AsyncClient(
+            timeout=30.0
+        ) as client:
 
-        logger.info(
-            "WhatsApp send status=%s body=%s",
-            result.status_code,
-            result.text[:500],
-        )
+            response = await client.post(
+                url,
+                headers=headers,
+                json=payload,
+            )
 
-        result.raise_for_status()
+            if response.is_success:
+                return True
 
-        return True
+            logger.error(
+                "Meta WhatsApp API error: %s",
+                response.text,
+            )
 
-    except requests.RequestException:
+            return False
+
+    except Exception as exc:
+
         logger.exception(
-            "WhatsApp message sending failed"
+            "Failed to send Meta WhatsApp message: %s",
+            exc,
         )
+
         return False
 
 
-# ============================================================
-# META MESSAGE PARSER
-# ============================================================
-
 def parse_meta_message(
-    data: Dict[str, Any],
-) -> Tuple[
-    Optional[str],
-    str,
-    Optional[str],
-]:
+    body: Dict[str, Any],
+) -> Optional[Dict[str, str]]:
+    """
+    Extract sender phone and text from Meta webhook payload.
+    """
 
     try:
 
-        entry = data.get(
+        entries = body.get(
             "entry",
             [],
         )
 
-        if not entry:
-            return None, "", None
+        if not entries:
+            return None
 
-        changes = entry[0].get(
+        changes = entries[0].get(
             "changes",
             [],
         )
 
         if not changes:
-            return None, "", None
+            return None
 
         value = changes[0].get(
             "value",
@@ -497,703 +546,825 @@ def parse_meta_message(
         )
 
         if not messages:
-            return None, "", None
+            return None
 
-        first_message = messages[0]
+        message = messages[0]
 
-        sender_phone = str(
-            first_message.get(
-                "from",
+        sender_phone = (
+            message.get(
+                "from"
+            )
+        )
+
+        message_type = (
+            message.get(
+                "type"
+            )
+        )
+
+        # ----------------------------------------------------
+        # Currently process text messages only
+        # ----------------------------------------------------
+
+        if message_type != "text":
+            return None
+
+        text_data = message.get(
+            "text",
+            {},
+        )
+
+        message_text = (
+            text_data.get(
+                "body"
+            )
+        )
+
+        if not sender_phone:
+            return None
+
+        if not message_text:
+            return None
+
+        return {
+            "sender_phone": (
+                sender_phone
+            ),
+            "message_text": (
+                message_text.strip()
+            ),
+        }
+
+    except Exception as exc:
+
+        logger.exception(
+            "Failed to parse Meta message: %s",
+            exc,
+        )
+
+        return None
+    # ============================================================
+# MAIN CUSTOMER MESSAGE FLOW - PART 5
+# ============================================================
+
+async def handle_customer_message(
+    sender_phone: str,
+    user_message: str,
+) -> Optional[str]:
+    """
+    Complete customer conversation flow.
+
+    Flow:
+
+    Customer message
+          ↓
+    Customer memory update
+          ↓
+    Lead update
+          ↓
+    Recent history
+          ↓
+    AI response
+          ↓
+    Save AI response
+          ↓
+    Return response
+    """
+
+    if not sender_phone:
+        return None
+
+    if not user_message:
+        return None
+
+    db = SessionLocal()
+
+    try:
+
+        # ====================================================
+        # 1. CUSTOMER MEMORY
+        # ====================================================
+
+        customer_memory = (
+            process_customer_memory(
+                sender_phone,
+                user_message,
+            )
+        )
+
+        logger.info(
+            "Customer memory updated for %s: %s",
+            sender_phone,
+            customer_memory,
+        )
+
+        # ====================================================
+        # 2. LEAD INFORMATION
+        # ====================================================
+
+        lead_data = extract_lead_info(
+            user_message
+        )
+
+        if is_potential_lead(
+            user_message
+        ):
+            try:
+
+                update_or_create_lead(
+                    db,
+                    sender_phone,
+                    lead_data,
+                )
+
+            except Exception as exc:
+
+                logger.exception(
+                    "Lead update failed: %s",
+                    exc,
+                )
+
+                db.rollback()
+
+        # ====================================================
+        # 3. RECENT CONVERSATION HISTORY
+        # ====================================================
+
+        history = build_chat_history(
+            db,
+            sender_phone,
+            HISTORY_LIMIT,
+        )
+
+        # ====================================================
+        # 4. DETECT AGENT
+        # ====================================================
+
+        agent_name = detect_agent(
+            user_message
+        )
+
+        # ====================================================
+        # 5. CUSTOMER MEMORY → AI CONTEXT
+        # ====================================================
+
+        customer_context = (
+            memory_to_text(
+                customer_memory
+            )
+        )
+
+        # ====================================================
+        # 6. GENERATE AI RESPONSE
+        # ====================================================
+
+        reply = await generate_agent_reply(
+            user_message=user_message,
+            history=history,
+            agent_name=agent_name,
+            business_name=BUSINESS_NAME,
+            customer_memory=customer_context,
+        )
+
+        if not reply:
+
+            reply = (
+                "Thoda technical issue aa gaya hai. "
+                "Ek baar phir message kar dijiye."
+            )
+
+        # ====================================================
+        # 7. SAVE CUSTOMER MESSAGE
+        # ====================================================
+
+        save_message(
+            db=db,
+            sender_phone=sender_phone,
+            content=user_message,
+            agent_name=agent_name,
+            sender_type="user",
+        )
+
+        # ====================================================
+        # 8. SAVE AI RESPONSE
+        # ====================================================
+
+        save_message(
+            db=db,
+            sender_phone=sender_phone,
+            content=reply,
+            agent_name=agent_name,
+            sender_type="assistant",
+        )
+
+        return reply
+
+    except Exception as exc:
+
+        logger.exception(
+            "Customer message handling failed: %s",
+            exc,
+        )
+
+        db.rollback()
+
+        return (
+            "Sorry, thoda technical issue aa gaya hai. "
+            "Please ek baar phir message kar dijiye."
+        )
+
+    finally:
+
+        db.close()
+        # ============================================================
+# META WHATSAPP WEBHOOK - PART 6 FINAL
+# ============================================================
+
+@router.get("/webhook")
+async def verify_meta_webhook(
+    request: Request,
+):
+    """
+    Meta WhatsApp webhook verification.
+    """
+
+    params = request.query_params
+
+    mode = params.get(
+        "hub.mode"
+    )
+
+    verify_token = params.get(
+        "hub.verify_token"
+    )
+
+    challenge = params.get(
+        "hub.challenge"
+    )
+
+    if (
+        mode == "subscribe"
+        and verify_token == META_VERIFY_TOKEN
+    ):
+        return PlainTextResponse(
+            challenge or ""
+        )
+
+    return PlainTextResponse(
+        "Verification failed",
+        status_code=403,
+    )
+
+
+@router.post("/webhook")
+async def meta_webhook(
+    request: Request,
+):
+    """
+    Receive incoming WhatsApp messages from Meta.
+
+    Flow:
+
+        Meta WhatsApp
+              ↓
+        Parse message
+              ↓
+        Duplicate check
+              ↓
+        Customer memory
+              ↓
+        AI response
+              ↓
+        Save messages
+              ↓
+        Send WhatsApp reply
+    """
+
+    try:
+
+        # ====================================================
+        # 1. READ META WEBHOOK
+        # ====================================================
+
+        body = await request.json()
+
+        parsed = parse_meta_message(
+            body
+        )
+
+        # ----------------------------------------------------
+        # Ignore:
+        # - status updates
+        # - unsupported message types
+        # - empty messages
+        # ----------------------------------------------------
+
+        if not parsed:
+
+            return {
+                "status": "ignored"
+            }
+
+        # ====================================================
+        # 2. GET MESSAGE ID
+        # ====================================================
+
+        message_id = parsed.get(
+            "message_id"
+        )
+
+        # ====================================================
+        # 3. DUPLICATE MESSAGE PROTECTION
+        # ====================================================
+
+        if message_id:
+
+            if is_duplicate_message(
+                message_id
+            ):
+
+                logger.info(
+                    "Duplicate Meta message ignored: %s",
+                    message_id,
+                )
+
+                return {
+                    "status": "duplicate_ignored"
+                }
+
+        # ====================================================
+        # 4. GET CUSTOMER + MESSAGE
+        # ====================================================
+
+        sender_phone = parsed[
+            "sender_phone"
+        ]
+
+        user_message = parsed[
+            "message_text"
+        ]
+
+        logger.info(
+            "Incoming Meta WhatsApp message | "
+            "phone=%s | message=%s",
+            sender_phone,
+            user_message,
+        )
+
+        # ====================================================
+        # 5. PROCESS CUSTOMER MESSAGE
+        # ====================================================
+
+        reply = await handle_customer_message(
+            sender_phone=sender_phone,
+            user_message=user_message,
+        )
+
+        # ====================================================
+        # 6. NO RESPONSE
+        # ====================================================
+
+        if not reply:
+
+            logger.warning(
+                "No AI reply generated for %s",
+                sender_phone,
+            )
+
+            return {
+                "status": "no_reply"
+            }
+
+        # ====================================================
+        # 7. SEND AI RESPONSE TO WHATSAPP
+        # ====================================================
+
+        sent = await send_meta_whatsapp_message(
+            recipient_phone=sender_phone,
+            message_text=reply,
+        )
+
+        # ====================================================
+        # 8. MESSAGE SEND FAILED
+        # ====================================================
+
+        if not sent:
+
+            logger.error(
+                "Failed to send Meta WhatsApp reply "
+                "to %s",
+                sender_phone,
+            )
+
+            return {
+                "status": "reply_generated",
+                "message_sent": False,
+            }
+
+        # ====================================================
+        # 9. SUCCESS
+        # ====================================================
+
+        logger.info(
+            "Meta WhatsApp reply sent successfully "
+            "to %s",
+            sender_phone,
+        )
+
+        return {
+            "status": "success",
+            "message_sent": True,
+        }
+
+    except Exception as exc:
+
+        logger.exception(
+            "Meta WhatsApp webhook error: %s",
+            exc,
+        )
+
+        # ----------------------------------------------------
+        # Return a response instead of crashing the webhook.
+        # ----------------------------------------------------
+
+        return {
+            "status": "error"
+        }
+    # ============================================================
+# TWILIO WHATSAPP WEBHOOK - PART 7
+# ============================================================
+
+from fastapi.responses import Response
+
+
+@router.post("/incoming")
+async def twilio_incoming(
+    request: Request,
+):
+    """
+    Twilio WhatsApp webhook.
+
+    Twilio se incoming message receive karke
+    same customer-memory + AI flow use karta hai.
+    """
+
+    try:
+
+        form = await request.form()
+
+        sender = str(
+            form.get(
+                "From",
                 "",
             )
         ).strip()
 
-        message_id = first_message.get(
-            "id"
-        )
+        user_message = str(
+            form.get(
+                "Body",
+                "",
+            )
+        ).strip()
 
-        message_type = first_message.get(
-            "type",
-            "text",
-        )
-
-        user_message = ""
-
-        if message_type == "text":
-
-            user_message = str(
-                first_message
-                .get("text", {})
-                .get("body", "")
-            ).strip()
-
-        elif message_type == "button":
-
-            user_message = str(
-                first_message
-                .get("button", {})
-                .get("text", "")
-            ).strip()
-
-        elif message_type == "interactive":
-
-            interactive = first_message.get(
-                "interactive",
-                {},
+        if not sender:
+            return Response(
+                content="",
+                media_type="text/xml",
             )
 
-            if "button_reply" in interactive:
+        if not user_message:
+            return Response(
+                content="",
+                media_type="text/xml",
+            )
 
-                user_message = str(
-                    interactive[
-                        "button_reply"
-                    ].get(
-                        "title",
-                        "",
-                    )
-                ).strip()
+        # ----------------------------------------------------
+        # Twilio sender format:
+        #
+        # whatsapp:+919876543210
+        #
+        # Our memory system needs a stable customer key.
+        # ----------------------------------------------------
 
-            elif "list_reply" in interactive:
+        sender_phone = sender
 
-                user_message = str(
-                    interactive[
-                        "list_reply"
-                    ].get(
-                        "title",
-                        "",
-                    )
-                ).strip()
+        if sender_phone.startswith(
+            "whatsapp:"
+        ):
+            sender_phone = (
+                sender_phone[
+                    len("whatsapp:") :
+                ]
+            )
 
-        return (
+        logger.info(
+            "Incoming Twilio message from %s: %s",
             sender_phone,
             user_message,
-            message_id,
-        )
-
-    except Exception:
-
-        logger.exception(
-            "Could not parse Meta message"
-        )
-
-        return None, "", None
-
-
-# ============================================================
-# DUPLICATE MESSAGE PROTECTION
-# ============================================================
-
-def is_duplicate_message(
-    db: Session,
-    message_id: Optional[str],
-) -> bool:
-
-    if not message_id:
-        return False
-
-    if not hasattr(
-        Message,
-        "whatsapp_message_id",
-    ):
-        return False
-
-    try:
-
-        existing = (
-            db.query(Message)
-            .filter(
-                Message.whatsapp_message_id
-                == message_id
-            )
-            .first()
-        )
-
-        return existing is not None
-
-    except Exception:
-
-        logger.exception(
-            "Duplicate message check failed"
-        )
-
-        return False
-
-
-# ============================================================
-# LEAD MANAGEMENT
-# ============================================================
-
-def update_or_create_lead(
-    db: Session,
-    sender_phone: str,
-    extracted: Dict[str, Any],
-):
-
-    lead = (
-        db.query(Lead)
-        .filter(
-            Lead.phone == sender_phone
-        )
-        .first()
-    )
-
-    if not lead:
-
-        lead = Lead(
-            phone=sender_phone,
-            name=(
-                extracted.get("name")
-                or "Lead Customer"
-            ),
-            company=(
-                extracted.get("company")
-                or "N/A"
-            ),
-            status="New",
-        )
-
-        db.add(lead)
-
-    else:
-
-        if extracted.get("name"):
-            lead.name = extracted["name"]
-
-        if extracted.get("company"):
-            lead.company = extracted[
-                "company"
-            ]
-
-    db.commit()
-    db.refresh(lead)
-
-    return lead
-
-
-# ============================================================
-# SAVE MESSAGE
-# ============================================================
-
-def save_message(
-    db: Session,
-    sender_phone: str,
-    user_message: str,
-    ai_response: str,
-    agent_used: str,
-    whatsapp_message_id: Optional[str] = None,
-):
-
-    try:
-
-        record_kwargs = {
-            "sender_phone": sender_phone,
-            "content": user_message,
-            "agent_used": agent_used,
-        }
-
-        if hasattr(
-            Message,
-            "whatsapp_message_id",
-        ):
-            record_kwargs[
-                "whatsapp_message_id"
-            ] = whatsapp_message_id
-
-        record = Message(
-            **record_kwargs
-        )
-
-        if hasattr(
-            record,
-            "agent_reply",
-        ):
-            record.agent_reply = (
-                ai_response
-            )
-
-        db.add(record)
-        db.commit()
-
-    except Exception:
-
-        db.rollback()
-
-        logger.exception(
-            "Could not save message"
-        )
-
-
-# ============================================================
-# META / WHATSAPP MESSAGE PROCESSOR
-# ============================================================
-
-async def handle_async_meta_message(
-    sender_phone: str,
-    user_message: str,
-    whatsapp_message_id: Optional[str] = None,
-):
-
-    db: Session = SessionLocal()
-
-    try:
-
-        # ----------------------------------------------------
-        # Duplicate protection
-        # ----------------------------------------------------
-
-        if is_duplicate_message(
-            db,
-            whatsapp_message_id,
-        ):
-
-            logger.info(
-                "Duplicate WhatsApp message skipped: %s",
-                whatsapp_message_id,
-            )
-
-            return
-
-        # ----------------------------------------------------
-        # Get existing conversation FIRST
-        # ----------------------------------------------------
-
-        history = build_chat_history(
-            db=db,
-            sender_phone=sender_phone,
-            limit=HISTORY_LIMIT,
-        )
-
-        # ----------------------------------------------------
-        # Build cumulative customer profile
-        # ----------------------------------------------------
-
-        profile = build_customer_profile(
-            history=history,
-            current_message=user_message,
-        )
-
-        # ----------------------------------------------------
-        # Current message extraction
-        # ----------------------------------------------------
-
-        selected_agent = detect_agent(
-            user_message
-        )
-
-        extracted = extract_lead_info(
-            user_message
-        )
-
-        high_intent = is_potential_lead(
-            user_message
-        )
-
-        # ----------------------------------------------------
-        # Update lead
-        # ----------------------------------------------------
-
-        lead = None
-
-        if (
-            selected_agent == "sales"
-            or high_intent
-        ):
-
-            try:
-
-                lead = update_or_create_lead(
-                    db=db,
-                    sender_phone=sender_phone,
-                    extracted=extracted,
-                )
-
-            except Exception:
-
-                db.rollback()
-
-                logger.exception(
-                    "Lead processing failed"
-                )
-
-        # ----------------------------------------------------
-        # Admin alert
-        # ----------------------------------------------------
-
-        has_contact = bool(
-            profile.get("phone")
-            or profile.get("email")
-            or extracted.get("phone")
-            or extracted.get("email")
-        )
-
-        if (
-            selected_agent == "sales"
-            and (
-                has_contact
-                or high_intent
-            )
-        ):
-
-            try:
-
-                send_admin_alert(
-                    lead_name=(
-                        profile.get("name")
-                        or getattr(
-                            lead,
-                            "name",
-                            "Lead Customer",
-                        )
-                    ),
-                    company=(
-                        profile.get("company")
-                        or getattr(
-                            lead,
-                            "company",
-                            "N/A",
-                        )
-                    ),
-                    phone=(
-                        profile.get("phone")
-                        or sender_phone
-                    ),
-                )
-
-            except Exception:
-
-                logger.exception(
-                    "Admin notification failed"
-                )
-
-        # ----------------------------------------------------
-        # Build memory instruction
-        # ----------------------------------------------------
-
-        profile_instruction = (
-            build_profile_instruction(
-                profile
-            )
         )
 
         # ----------------------------------------------------
         # Generate AI response
         # ----------------------------------------------------
 
-        try:
-
-            ai_response = (
-                await generate_agent_reply(
-                    user_message=user_message,
-                    history=history,
-                    agent_name=selected_agent,
-                    business_name=BUSINESS_NAME,
-                    customer_profile=profile_instruction,
-                )
-            )
-
-        except TypeError:
-
-            # Backward compatibility:
-            # If ai_agent.py has not yet been updated
-            # with customer_profile parameter.
-
-            logger.warning(
-                "AI agent does not support customer_profile yet"
-            )
-
-            ai_response = (
-                await generate_agent_reply(
-                    user_message=user_message,
-                    history=history,
-                    agent_name=selected_agent,
-                    business_name=BUSINESS_NAME,
-                )
-            )
-
-        except Exception:
-
-            logger.exception(
-                "AI generation failed"
-            )
-
-            ai_response = (
-                "Mujhe is waqt response generate "
-                "karne mein temporary issue aa raha hai. "
-                "Kripya ek pal baad dobara try karein."
-            )
-
-        # ----------------------------------------------------
-        # Save complete turn
-        # ----------------------------------------------------
-
-        save_message(
-            db=db,
+        reply = await handle_customer_message(
             sender_phone=sender_phone,
             user_message=user_message,
-            ai_response=ai_response,
-            agent_used=selected_agent,
-            whatsapp_message_id=whatsapp_message_id,
         )
+
+        if not reply:
+            reply = (
+                "Sorry, thoda technical issue aa gaya hai."
+            )
 
         # ----------------------------------------------------
-        # Send WhatsApp reply
+        # Twilio XML response
         # ----------------------------------------------------
 
-        send_meta_whatsapp_message(
-            to_phone=sender_phone,
-            message_text=ai_response,
+        escaped_reply = (
+            reply
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace('"', "&quot;")
+            .replace("'", "&apos;")
         )
 
-    except Exception:
-
-        db.rollback()
-
-        logger.exception(
-            "Background WhatsApp processing failed"
+        twiml = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            "<Response>"
+            f"<Message>{escaped_reply}</Message>"
+            "</Response>"
         )
-
-    finally:
-
-        db.close()
-
-
-# ============================================================
-# META WEBHOOK VERIFICATION
-# ============================================================
-
-@router.get("/webhook")
-@router.get("/chat/webhook")
-async def verify_webhook(
-    hub_mode: str = Query(
-        None,
-        alias="hub.mode",
-    ),
-    hub_challenge: str = Query(
-        None,
-        alias="hub.challenge",
-    ),
-    hub_verify_token: str = Query(
-        None,
-        alias="hub.verify_token",
-    ),
-):
-
-    expected_token = os.getenv(
-        "WHATSAPP_VERIFY_TOKEN",
-        VERIFY_TOKEN,
-    )
-
-    if (
-        hub_mode == "subscribe"
-        and hub_verify_token
-        == expected_token
-    ):
 
         return Response(
-            content=hub_challenge or "",
-            media_type="text/plain",
+            content=twiml,
+            media_type="text/xml",
         )
 
-    raise HTTPException(
-        status_code=403,
-        detail="Verification token mismatch",
-    )
-
-
-# ============================================================
-# META WEBHOOK RECEIVER
-# ============================================================
-
-@router.post("/webhook")
-@router.post("/chat/webhook")
-async def webhook_receiver(
-    request: Request,
-    background_tasks: BackgroundTasks,
-):
-
-    try:
-
-        data = await request.json()
-
-    except Exception:
+    except Exception as exc:
 
         logger.exception(
-            "Could not read webhook JSON"
+            "Twilio webhook error: %s",
+            exc,
         )
 
-        return {
-            "status": "ignored"
-        }
+        return Response(
+            content=(
+                '<?xml version="1.0" encoding="UTF-8"?>'
+                "<Response></Response>"
+            ),
+            media_type="text/xml",
+        )
+    # ============================================================
+# FINAL CHAT ROUTE HELPERS - PART 8
+# ============================================================
 
-    (
+def clear_customer_memory(
+    sender_phone: str,
+) -> None:
+    """
+    Clear only one customer's temporary memory.
+    """
+
+    if not sender_phone:
+        return
+
+    CUSTOMER_MEMORY.pop(
         sender_phone,
-        user_message,
-        whatsapp_message_id,
-    ) = parse_meta_message(data)
-
-    if (
-        not sender_phone
-        or not user_message
-    ):
-
-        return {
-            "status": "ok",
-            "reason": "no_message",
-        }
-
-    background_tasks.add_task(
-        handle_async_meta_message,
-        sender_phone,
-        user_message,
-        whatsapp_message_id,
+        None,
     )
+
+
+def get_customer_debug_info(
+    sender_phone: str,
+) -> Dict[str, Any]:
+    """
+    Useful for local debugging/testing.
+    """
+
+    if not sender_phone:
+        return {
+            "phone": None,
+            "memory": {},
+        }
 
     return {
-        "status": "success"
+        "phone": sender_phone,
+        "memory": get_customer_memory(
+            sender_phone
+        ),
     }
-
-
 # ============================================================
-# TWILIO INCOMING WEBHOOK
+# DUPLICATE MESSAGE PROTECTION - PART 10
 # ============================================================
 
-@router.post("/incoming")
-@router.post("/chat/incoming")
-async def incoming_chat(
-    request: Request,
-    db: Session = Depends(get_db),
-):
+PROCESSED_MESSAGE_IDS = set()
 
-    form_data = await request.form()
 
-    sender_phone = str(
-        form_data.get(
-            "From",
-            "",
-        )
-    ).replace(
-        "whatsapp:",
-        "",
-    ).strip()
+def is_duplicate_message(
+    message_id: Optional[str],
+) -> bool:
+    """
+    Check whether a Meta/Twilio message was already processed.
 
-    user_message = str(
-        form_data.get(
-            "Body",
-            "",
-        )
-    ).strip()
+    This prevents duplicate AI replies when a webhook is
+    delivered more than once.
+    """
 
-    if (
-        not sender_phone
-        or not user_message
-    ):
+    if not message_id:
+        return False
 
-        twilio_response = (
-            MessagingResponse()
-        )
+    if message_id in PROCESSED_MESSAGE_IDS:
+        return True
 
-        return Response(
-            content=str(
-                twilio_response
-            ),
-            media_type="application/xml",
-        )
-
-    # --------------------------------------------------------
-    # Existing conversation
-    # --------------------------------------------------------
-
-    history = build_chat_history(
-        db=db,
-        sender_phone=sender_phone,
-        limit=HISTORY_LIMIT,
+    PROCESSED_MESSAGE_IDS.add(
+        message_id
     )
 
-    # --------------------------------------------------------
-    # Customer profile
-    # --------------------------------------------------------
+    # Keep memory bounded.
+    if len(PROCESSED_MESSAGE_IDS) > 5000:
 
-    profile = build_customer_profile(
-        history=history,
-        current_message=user_message,
-    )
+        oldest_ids = list(
+            PROCESSED_MESSAGE_IDS
+        )[:1000]
 
-    selected_agent = detect_agent(
-        user_message
-    )
+        for old_id in oldest_ids:
 
-    # --------------------------------------------------------
-    # Generate reply
-    # --------------------------------------------------------
+            PROCESSED_MESSAGE_IDS.discard(
+                old_id
+            )
+
+    return False
+# ============================================================
+# META MESSAGE PARSER - PART 10A FINAL
+# ============================================================
+
+def parse_meta_message(
+    body: Dict[str, Any],
+) -> Optional[Dict[str, str]]:
+    """
+    Parse incoming Meta WhatsApp webhook payload.
+
+    Extracts:
+
+        message_id
+        sender_phone
+        message_text
+
+    IMPORTANT:
+        message_id is used by the duplicate protection
+        system to prevent processing the same WhatsApp
+        message more than once.
+    """
 
     try:
 
-        profile_instruction = (
-            build_profile_instruction(
-                profile
+        # ====================================================
+        # 1. ENTRY
+        # ====================================================
+
+        entries = body.get(
+            "entry",
+            [],
+        )
+
+        if not entries:
+            return None
+
+        # ====================================================
+        # 2. CHANGES
+        # ====================================================
+
+        changes = entries[0].get(
+            "changes",
+            [],
+        )
+
+        if not changes:
+            return None
+
+        # ====================================================
+        # 3. VALUE
+        # ====================================================
+
+        value = changes[0].get(
+            "value",
+            {},
+        )
+
+        # ====================================================
+        # 4. MESSAGES
+        # ====================================================
+
+        messages = value.get(
+            "messages",
+            [],
+        )
+
+        # Status updates normally don't contain
+        # messages, so safely ignore them.
+
+        if not messages:
+            return None
+
+        # ====================================================
+        # 5. FIRST MESSAGE
+        # ====================================================
+
+        message = messages[0]
+
+        # ====================================================
+        # 6. UNIQUE MESSAGE ID
+        # ====================================================
+
+        message_id = (
+            message.get(
+                "id"
             )
         )
 
-        try:
+        # ====================================================
+        # 7. CUSTOMER PHONE
+        # ====================================================
 
-            ai_response = (
-                await generate_agent_reply(
-                    user_message=user_message,
-                    history=history,
-                    agent_name=selected_agent,
-                    business_name=BUSINESS_NAME,
-                    customer_profile=profile_instruction,
-                )
+        sender_phone = (
+            message.get(
+                "from"
             )
+        )
 
-        except TypeError:
+        # ====================================================
+        # 8. MESSAGE TYPE
+        # ====================================================
 
-            ai_response = (
-                await generate_agent_reply(
-                    user_message=user_message,
-                    history=history,
-                    agent_name=selected_agent,
-                    business_name=BUSINESS_NAME,
-                )
+        message_type = (
+            message.get(
+                "type"
             )
+        )
 
-    except Exception:
+        # ----------------------------------------------------
+        # Currently process text messages only.
+        # ----------------------------------------------------
+
+        if message_type != "text":
+            return None
+
+        # ====================================================
+        # 9. TEXT DATA
+        # ====================================================
+
+        text_data = message.get(
+            "text",
+            {},
+        )
+
+        message_text = (
+            text_data.get(
+                "body"
+            )
+        )
+
+        # ====================================================
+        # 10. VALIDATION
+        # ====================================================
+
+        if not sender_phone:
+            return None
+
+        if not message_text:
+            return None
+
+        message_text = (
+            str(message_text)
+            .strip()
+        )
+
+        if not message_text:
+            return None
+
+        # ====================================================
+        # 11. RETURN PARSED MESSAGE
+        # ====================================================
+
+        return {
+            "message_id": (
+                message_id or ""
+            ),
+            "sender_phone": (
+                sender_phone
+            ),
+            "message_text": (
+                message_text
+            ),
+        }
+
+    except Exception as exc:
 
         logger.exception(
-            "Twilio AI generation failed"
+            "Failed to parse Meta WhatsApp message: %s",
+            exc,
         )
 
-        ai_response = (
-            "Mujhe is waqt response generate "
-            "karne mein temporary issue aa raha hai. "
-            "Kripya ek pal baad dobara try karein."
-        )
-
-    # --------------------------------------------------------
-    # Save
-    # --------------------------------------------------------
-
-    save_message(
-        db=db,
-        sender_phone=sender_phone,
-        user_message=user_message,
-        ai_response=ai_response,
-        agent_used=selected_agent,
-    )
-
-    # --------------------------------------------------------
-    # Twilio response
-    # --------------------------------------------------------
-
-    twilio_response = MessagingResponse()
-
-    twilio_response.message(
-        str(ai_response)
-    )
-
-    return Response(
-        content=str(
-            twilio_response
-        ),
-        media_type="application/xml",
-    )
+        return None
