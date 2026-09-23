@@ -12,9 +12,8 @@ logger = logging.getLogger(__name__)
 
 # Production Groq models (Fast and reliable)
 GROQ_MODELS = [
-    os.getenv("GROQ_PRIMARY_MODEL", "llama-3.3-70b-specdec"),
-    "llama-3.2-3b-preview",
-    "llama-3.2-1b-preview",
+    os.getenv("GROQ_PRIMARY_MODEL", "llama-3.3-70b-versatile"),
+    "llama-3.1-8b-instant",
 ]
 
 GROQ_MODELS = [model.strip() for model in GROQ_MODELS if model and model.strip()]
