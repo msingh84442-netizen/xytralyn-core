@@ -6,7 +6,7 @@ Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="Xytralyn Core Engine")
 
-app.include_router(chat.router)
+app.include_router(chat.router, prefix="/chat")
 app.include_router(leads.router)
 
 @app.get("/")
