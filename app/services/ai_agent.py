@@ -12,17 +12,8 @@ logger = logging.getLogger(__name__)
 
 # Production Groq models (Fast and reliable)
 GROQ_MODELS = [
-    os.getenv(
-        "GROQ_PRIMARY_MODEL",
-        "openai/gpt-oss-20b",
-    ),
-    "openai/gpt-oss-120b",
-]
-
-GROQ_MODELS = [
-    model.strip()
-    for model in GROQ_MODELS
-    if model and model.strip()
+    os.getenv("GROQ_PRIMARY_MODEL", "llama-3.3-70b-versatile"),
+    "llama-3.1-8b-instant",
 ]
 
 GROQ_MODELS = list(dict.fromkeys(GROQ_MODELS))
