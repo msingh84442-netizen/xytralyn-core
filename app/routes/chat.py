@@ -1,6 +1,6 @@
 import os
 import logging
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional, Tuple
 
 import requests
 from fastapi import (
@@ -97,7 +97,7 @@ def send_meta_whatsapp_message(
         logger.error("WhatsApp token or phone ID is missing")
         return False
 
-    url = f"https://graph.facebook.com/v20.0/{phone_id}/messages"
+    url = f"https://graph.facebook.com/v21.0/{phone_id}/messages"
 
     headers = {
         "Authorization": f"Bearer {token}",
@@ -121,7 +121,12 @@ def send_meta_whatsapp_message(
             timeout=15,
         )
 
-        logger.info("WhatsApp response status=%s", result.status_code)
+        logger.info(
+            "WhatsApp send status=%s body=%s",
+            result.status_code,
+            result.text[:500],
+        )
+
         result.raise_for_status()
         return True
 
@@ -130,50 +135,79 @@ def send_meta_whatsapp_message(
         return False
 
 
-def parse_meta_message(data: Dict[str, Any]):
+def parse_meta_message(
+    data: Dict[str, Any],
+) -> Tuple[Optional[str], str, Optional[str]]:
     try:
-        entry = data.get("entry", [{}])[0]
-        changes = entry.get("changes", [{}])[0]
-        value = changes.get("value", {})
+        entry = data.get("entry", [])
+        if not entry:
+            return None, "", None
+
+        changes = entry[0].get("changes", [])
+        if not changes:
+            return None, "", None
+
+        value = changes[0].get("value", {})
         messages = value.get("messages", [])
 
         if not messages:
-            return None, ""
+            return None, "", None
 
         first_message = messages[0]
+
         sender_phone = str(first_message.get("from", "")).strip()
+        message_id = first_message.get("id")
         message_type = first_message.get("type", "text")
 
         user_message = ""
 
         if message_type == "text":
-            user_message = str(
-                first_message.get("text", {}).get("body", "")
-            ).strip()
+            user_message = str(first_message.get("text", {}).get("body", "")).strip()
 
         elif message_type == "button":
-            user_message = str(
-                first_message.get("button", {}).get("text", "")
-            ).strip()
+            user_message = str(first_message.get("button", {}).get("text", "")).strip()
 
         elif message_type == "interactive":
             interactive = first_message.get("interactive", {})
 
             if "button_reply" in interactive:
-                user_message = str(
-                    interactive["button_reply"].get("title", "")
-                ).strip()
+                user_message = str(interactive["button_reply"].get("title", "")).strip()
 
             elif "list_reply" in interactive:
-                user_message = str(
-                    interactive["list_reply"].get("title", "")
-                ).strip()
+                user_message = str(interactive["list_reply"].get("title", "")).strip()
 
-        return sender_phone, user_message
+        return (
+            sender_phone,
+            user_message,
+            message_id,
+        )
 
     except Exception:
         logger.exception("Could not parse Meta message")
-        return None, ""
+        return None, "", None
+
+
+def is_duplicate_message(
+    db: Session,
+    message_id: Optional[str],
+) -> bool:
+    if not message_id:
+        return False
+
+    if not hasattr(Message, "whatsapp_message_id"):
+        return False
+
+    try:
+        existing = (
+            db.query(Message)
+            .filter(Message.whatsapp_message_id == message_id)
+            .first()
+        )
+        return existing is not None
+
+    except Exception:
+        logger.exception("Duplicate message check failed")
+        return False
 
 
 def update_or_create_lead(
@@ -181,7 +215,11 @@ def update_or_create_lead(
     sender_phone: str,
     extracted: Dict[str, Any],
 ):
-    lead = db.query(Lead).filter(Lead.phone == sender_phone).first()
+    lead = (
+        db.query(Lead)
+        .filter(Lead.phone == sender_phone)
+        .first()
+    )
 
     if not lead:
         lead = Lead(
@@ -208,13 +246,19 @@ def save_message(
     user_message: str,
     ai_response: str,
     agent_used: str,
+    whatsapp_message_id: Optional[str] = None,
 ):
     try:
-        record = Message(
-            sender_phone=sender_phone,
-            content=user_message,
-            agent_used=agent_used,
-        )
+        record_kwargs = {
+            "sender_phone": sender_phone,
+            "content": user_message,
+            "agent_used": agent_used,
+        }
+
+        if hasattr(Message, "whatsapp_message_id"):
+            record_kwargs["whatsapp_message_id"] = whatsapp_message_id
+
+        record = Message(**record_kwargs)
 
         if hasattr(record, "agent_reply"):
             record.agent_reply = ai_response
@@ -227,14 +271,24 @@ def save_message(
         logger.exception("Could not save message")
 
 
-async def handle_async_meta_message(sender_phone: str, user_message: str):
+async def handle_async_meta_message(
+    sender_phone: str,
+    user_message: str,
+    whatsapp_message_id: Optional[str] = None,
+):
     db: Session = SessionLocal()
+
     try:
+        if is_duplicate_message(db, whatsapp_message_id):
+            logger.info("Duplicate WhatsApp message skipped: %s", whatsapp_message_id)
+            return
+
         selected_agent = detect_agent(user_message)
         extracted = extract_lead_info(user_message)
         high_intent = is_potential_lead(user_message)
 
         lead = None
+
         if selected_agent == "sales" or high_intent:
             try:
                 lead = update_or_create_lead(
@@ -284,12 +338,18 @@ async def handle_async_meta_message(sender_phone: str, user_message: str):
             user_message=user_message,
             ai_response=ai_response,
             agent_used=selected_agent,
+            whatsapp_message_id=whatsapp_message_id,
         )
 
         send_meta_whatsapp_message(
             to_phone=sender_phone,
             message_text=ai_response,
         )
+
+    except Exception:
+        db.rollback()
+        logger.exception("Background WhatsApp processing failed")
+
     finally:
         db.close()
 
@@ -327,7 +387,11 @@ async def webhook_receiver(
         logger.exception("Could not read webhook JSON")
         return {"status": "ignored"}
 
-    sender_phone, user_message = parse_meta_message(data)
+    (
+        sender_phone,
+        user_message,
+        whatsapp_message_id,
+    ) = parse_meta_message(data)
 
     if not sender_phone or not user_message:
         return {
@@ -335,11 +399,11 @@ async def webhook_receiver(
             "reason": "no_message",
         }
 
-    # Meta webhook timeout aur 3x message loop avoid karne ke liye background task
     background_tasks.add_task(
         handle_async_meta_message,
         sender_phone,
         user_message,
+        whatsapp_message_id,
     )
 
     return {"status": "success"}
@@ -353,13 +417,15 @@ async def incoming_chat(
 ):
     form_data = await request.form()
 
-    sender_phone = str(
-        form_data.get("From", "")
-    ).replace("whatsapp:", "").strip()
+    sender_phone = str(form_data.get("From", "")).replace("whatsapp:", "").strip()
+    user_message = str(form_data.get("Body", "")).strip()
 
-    user_message = str(
-        form_data.get("Body", "")
-    ).strip()
+    if not sender_phone or not user_message:
+        twilio_response = MessagingResponse()
+        return Response(
+            content=str(twilio_response),
+            media_type="application/xml",
+        )
 
     selected_agent = detect_agent(user_message)
     history = build_chat_history(
@@ -376,6 +442,7 @@ async def incoming_chat(
             business_name="AstaLynx",
         )
     except Exception:
+        logger.exception("Twilio AI generation failed")
         ai_response = (
             "Mujhe is waqt response generate karne mein temporary issue aa raha hai. "
             "Kripya ek pal baad dobara try karein."
