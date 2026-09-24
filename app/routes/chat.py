@@ -1,13 +1,16 @@
 # ============================================================
-# CHAT ROUTE - PART 1
-# Imports + Constants
+# XYTRALYN CHAT ROUTE - PART 1
+# Imports + Config + Memory + DB Helpers
+# + GREEN-API Sender + GREEN-API Parser
 # ============================================================
 
 import os
+import re
 import logging
 from typing import Optional, Dict, Any, List
 
 import httpx
+
 from fastapi import APIRouter, Request
 from fastapi.responses import PlainTextResponse
 
@@ -39,19 +42,15 @@ HISTORY_LIMIT = 20
 
 
 # ============================================================
-# META WHATSAPP CONFIG
+# GREEN-API CONFIG
 # ============================================================
 
-META_ACCESS_TOKEN = os.getenv(
-    "META_ACCESS_TOKEN"
+GREEN_API_INSTANCE_ID = os.getenv(
+    "GREEN_API_INSTANCE_ID"
 )
 
-META_PHONE_NUMBER_ID = os.getenv(
-    "META_PHONE_NUMBER_ID"
-)
-
-META_VERIFY_TOKEN = os.getenv(
-    "META_VERIFY_TOKEN"
+GREEN_API_TOKEN = os.getenv(
+    "GREEN_API_TOKEN"
 )
 
 
@@ -76,29 +75,54 @@ TWILIO_WHATSAPP_FROM = os.getenv(
 # CUSTOMER MEMORY
 # ============================================================
 
-# Temporary in-process memory.
-#
-# Key:
-#     customer phone number
-#
-# Value:
-#     structured customer profile
-#
-# IMPORTANT:
-# This is customer-specific.
-# Customer A's memory will never be used for Customer B.
-#
-# Later we can move this to PostgreSQL/Redis for production.
-#
 CUSTOMER_MEMORY: Dict[str, Dict[str, Any]] = {}
+
+
+def normalize_customer_phone(
+    phone: str,
+) -> str:
+    """
+    Normalize Indian WhatsApp phone number.
+
+    Examples:
+
+        +91 98765 43210
+        919876543210
+        9876543210
+
+    Result:
+
+        919876543210
+    """
+
+    if not phone:
+        return ""
+
+    digits = re.sub(
+        r"\D",
+        "",
+        str(phone),
+    )
+
+    if (
+        len(digits) == 10
+        and digits[0] in "6789"
+    ):
+        digits = "91" + digits
+
+    return digits
 
 
 def get_customer_memory(
     phone: str,
 ) -> Dict[str, Any]:
     """
-    Get memory for ONE customer only.
+    Get memory for one customer only.
     """
+
+    phone = normalize_customer_phone(
+        phone
+    )
 
     if not phone:
         return {}
@@ -114,9 +138,12 @@ def update_customer_memory(
     new_data: Optional[Dict[str, Any]],
 ) -> Dict[str, Any]:
     """
-    Merge latest customer information into
-    this customer's existing memory.
+    Merge latest confirmed customer information.
     """
+
+    phone = normalize_customer_phone(
+        phone
+    )
 
     if not phone:
         return {}
@@ -135,8 +162,10 @@ def update_customer_memory(
     )
 
     return updated_memory
+
+
 # ============================================================
-# CHAT HISTORY + CUSTOMER MEMORY - PART 2
+# CHAT HISTORY
 # ============================================================
 
 def build_chat_history(
@@ -145,10 +174,13 @@ def build_chat_history(
     limit: int = HISTORY_LIMIT,
 ) -> List[Dict[str, str]]:
     """
-    Build recent conversation history for ONE customer.
-
-    Only this phone number's messages are loaded.
+    Build recent conversation history
+    for one customer only.
     """
+
+    sender_phone = normalize_customer_phone(
+        sender_phone
+    )
 
     if not sender_phone:
         return []
@@ -181,10 +213,6 @@ def build_chat_history(
         if not content:
             continue
 
-        # ----------------------------------------------------
-        # Determine message role
-        # ----------------------------------------------------
-
         sender_type = getattr(
             message,
             "sender_type",
@@ -198,14 +226,14 @@ def build_chat_history(
             role = "user"
 
         else:
-            # Existing database schema may not have
-            # sender_type. In that case use a safe fallback.
             role = "user"
 
         history.append(
             {
                 "role": role,
-                "content": str(content).strip(),
+                "content": str(
+                    content
+                ).strip(),
             }
         )
 
@@ -214,15 +242,22 @@ def build_chat_history(
     )
 
 
+# ============================================================
+# CUSTOMER MEMORY PROCESSING
+# ============================================================
+
 def process_customer_memory(
     sender_phone: str,
     user_message: str,
 ) -> Dict[str, Any]:
     """
-    Extract information ONLY from the current
-    customer message and merge it into that customer's
-    existing memory.
+    Extract information only from the
+    current customer message.
     """
+
+    sender_phone = normalize_customer_phone(
+        sender_phone
+    )
 
     if not sender_phone:
         return {}
@@ -232,17 +267,9 @@ def process_customer_memory(
             sender_phone
         )
 
-    # --------------------------------------------------------
-    # Extract ONLY from customer message
-    # --------------------------------------------------------
-
     new_data = extract_lead_info(
         user_message
     )
-
-    # --------------------------------------------------------
-    # Extract demo information
-    # --------------------------------------------------------
 
     from app.services.ai_agent import (
         extract_demo_datetime,
@@ -257,23 +284,15 @@ def process_customer_memory(
     )
 
     if demo_date:
-        new_data["demo_date"] = (
-            demo_date
-        )
+        new_data["demo_date"] = demo_date
 
     if demo_time:
-        new_data["demo_time"] = (
-            demo_time
-        )
+        new_data["demo_time"] = demo_time
 
     if demo_datetime:
         new_data["demo_datetime"] = (
             demo_datetime
         )
-
-    # --------------------------------------------------------
-    # Merge with existing customer memory
-    # --------------------------------------------------------
 
     return update_customer_memory(
         sender_phone,
@@ -285,7 +304,7 @@ def get_customer_context(
     sender_phone: str,
 ) -> str:
     """
-    Return compact confirmed customer context
+    Return confirmed customer context
     for the AI agent.
     """
 
@@ -296,8 +315,10 @@ def get_customer_context(
     return memory_to_text(
         memory
     )
+
+
 # ============================================================
-# LEAD + MESSAGE DATABASE HELPERS - PART 3
+# LEAD DATABASE
 # ============================================================
 
 def update_or_create_lead(
@@ -306,18 +327,19 @@ def update_or_create_lead(
     lead_data: Optional[Dict[str, Any]],
 ) -> Optional[Lead]:
     """
-    Create or update a lead using the customer's phone number.
+    Create or update lead using
+    customer phone number.
     """
+
+    sender_phone = normalize_customer_phone(
+        sender_phone
+    )
 
     if not sender_phone:
         return None
 
     if not lead_data:
         return None
-
-    # --------------------------------------------------------
-    # Find existing lead
-    # --------------------------------------------------------
 
     lead = (
         db.query(Lead)
@@ -327,10 +349,6 @@ def update_or_create_lead(
         )
         .first()
     )
-
-    # --------------------------------------------------------
-    # Create new lead
-    # --------------------------------------------------------
 
     if not lead:
 
@@ -353,11 +371,6 @@ def update_or_create_lead(
 
     else:
 
-        # ----------------------------------------------------
-        # Update ONLY fields actually provided
-        # by the customer.
-        # ----------------------------------------------------
-
         if lead_data.get("name"):
             lead.name = lead_data[
                 "name"
@@ -379,6 +392,10 @@ def update_or_create_lead(
     return lead
 
 
+# ============================================================
+# MESSAGE DATABASE
+# ============================================================
+
 def save_message(
     db,
     sender_phone: str,
@@ -390,9 +407,13 @@ def save_message(
     Save one message.
 
     sender_type:
-        user      -> customer message
-        assistant -> AI response
+        user
+        assistant
     """
+
+    sender_phone = normalize_customer_phone(
+        sender_phone
+    )
 
     if not sender_phone:
         return None
@@ -405,14 +426,6 @@ def save_message(
         content=content,
         agent_used=agent_name,
     )
-
-    # --------------------------------------------------------
-    # If your Message model contains sender_type,
-    # save it.
-    #
-    # getattr is used so the code doesn't crash if the
-    # existing SQLAlchemy model does not yet have this field.
-    # --------------------------------------------------------
 
     if hasattr(
         message,
@@ -427,55 +440,74 @@ def save_message(
     db.refresh(message)
 
     return message
+
+
 # ============================================================
-# META WHATSAPP HELPERS - PART 4
+# GREEN-API SEND MESSAGE
 # ============================================================
 
-async def send_meta_whatsapp_message(
+async def send_whatsapp_message(
     recipient_phone: str,
     message_text: str,
 ) -> bool:
     """
-    Send a WhatsApp message through Meta Cloud API.
+    Send WhatsApp message through GREEN-API.
     """
 
-    if not META_ACCESS_TOKEN:
+    if not GREEN_API_INSTANCE_ID:
         logger.error(
-            "META_ACCESS_TOKEN is missing."
+            "GREEN_API_INSTANCE_ID is missing."
         )
         return False
 
-    if not META_PHONE_NUMBER_ID:
+    if not GREEN_API_TOKEN:
         logger.error(
-            "META_PHONE_NUMBER_ID is missing."
+            "GREEN_API_TOKEN is missing."
         )
         return False
 
     if not recipient_phone:
+        logger.error(
+            "Recipient phone is missing."
+        )
         return False
 
     if not message_text:
+        logger.error(
+            "Message text is missing."
+        )
         return False
 
-    url = (
-        "https://graph.facebook.com/v23.0/"
-        f"{META_PHONE_NUMBER_ID}/messages"
+    phone_digits = (
+        normalize_customer_phone(
+            recipient_phone
+        )
     )
 
-    headers = {
-        "Authorization": (
-            f"Bearer {META_ACCESS_TOKEN}"
-        ),
-        "Content-Type": "application/json",
-    }
+    if not phone_digits:
+        logger.error(
+            "Invalid recipient phone: %s",
+            recipient_phone,
+        )
+        return False
+
+    chat_id = (
+        f"{phone_digits}@c.us"
+    )
+
+    url = (
+        "https://api.green-api.com/"
+        f"waInstance{GREEN_API_INSTANCE_ID}/"
+        f"sendMessage/{GREEN_API_TOKEN}"
+    )
 
     payload = {
-        "messaging_product": "whatsapp",
-        "to": recipient_phone,
-        "type": "text",
-        "text": {
-            "body": message_text,
-        },
+        "chatId": chat_id,
+        "message": message_text,
+    }
+
+    headers = {
+        "Content-Type": "application/json",
     }
 
     try:
@@ -490,121 +522,187 @@ async def send_meta_whatsapp_message(
                 json=payload,
             )
 
-            if response.is_success:
-                return True
+        if response.is_success:
 
-            logger.error(
-                "Meta WhatsApp API error: %s",
-                response.text,
+            logger.info(
+                "GREEN-API message sent successfully | chat=%s",
+                chat_id,
             )
 
-            return False
+            return True
+
+        logger.error(
+            "GREEN-API send error | "
+            "status=%s | response=%s",
+            response.status_code,
+            response.text,
+        )
+
+        return False
 
     except Exception as exc:
 
         logger.exception(
-            "Failed to send Meta WhatsApp message: %s",
+            "GREEN-API WhatsApp send failed: %s",
             exc,
         )
 
         return False
 
 
-def parse_meta_message(
+# ============================================================
+# GREEN-API INCOMING MESSAGE PARSER
+# ============================================================
+
+def parse_whatsapp_message(
     body: Dict[str, Any],
 ) -> Optional[Dict[str, str]]:
     """
-    Extract sender phone and text from Meta webhook payload.
+    Parse incoming GREEN-API text message.
     """
 
     try:
 
-        entries = body.get(
-            "entry",
-            [],
-        )
+        if body.get(
+            "typeWebhook"
+        ) != "incomingMessageReceived":
 
-        if not entries:
             return None
 
-        changes = entries[0].get(
-            "changes",
-            [],
+        message_id = body.get(
+            "idMessage",
+            "",
         )
 
-        if not changes:
-            return None
-
-        value = changes[0].get(
-            "value",
+        sender_data = body.get(
+            "senderData",
             {},
         )
 
-        messages = value.get(
-            "messages",
-            [],
+        chat_id = sender_data.get(
+            "chatId",
+            "",
         )
 
-        if not messages:
+        if not chat_id:
             return None
 
-        message = messages[0]
+        # Ignore WhatsApp groups
+        if "@g.us" in chat_id:
+            return None
+
+        message_data = body.get(
+            "messageData",
+            {},
+        )
+
+        if message_data.get(
+            "typeMessage"
+        ) != "textMessage":
+
+            return None
+
+        text_data = message_data.get(
+            "textMessageData",
+            {},
+        )
+
+        message_text = text_data.get(
+            "textMessage",
+            "",
+        )
+
+        if not message_text:
+            return None
+
+        message_text = str(
+            message_text
+        ).strip()
+
+        if not message_text:
+            return None
+
+        sender_phone = chat_id.split(
+            "@",
+            1,
+        )[0]
 
         sender_phone = (
-            message.get(
-                "from"
-            )
-        )
-
-        message_type = (
-            message.get(
-                "type"
-            )
-        )
-
-        # ----------------------------------------------------
-        # Currently process text messages only
-        # ----------------------------------------------------
-
-        if message_type != "text":
-            return None
-
-        text_data = message.get(
-            "text",
-            {},
-        )
-
-        message_text = (
-            text_data.get(
-                "body"
+            normalize_customer_phone(
+                sender_phone
             )
         )
 
         if not sender_phone:
             return None
 
-        if not message_text:
-            return None
-
         return {
-            "sender_phone": (
-                sender_phone
+            "message_id": str(
+                message_id or ""
             ),
-            "message_text": (
-                message_text.strip()
-            ),
+            "sender_phone": sender_phone,
+            "message_text": message_text,
         }
 
     except Exception as exc:
 
         logger.exception(
-            "Failed to parse Meta message: %s",
+            "Failed to parse GREEN-API message: %s",
             exc,
         )
 
         return None
     # ============================================================
-# MAIN CUSTOMER MESSAGE FLOW - PART 5
+# XYTRALYN CHAT ROUTE - PART 2
+# Duplicate Protection
+# Customer Handler
+# GREEN-API Webhook
+# TWILIO Webhook
+# Health + Debug
+# ============================================================
+
+
+# ============================================================
+# DUPLICATE MESSAGE PROTECTION
+# ============================================================
+
+PROCESSED_MESSAGE_IDS = set()
+
+
+def is_duplicate_message(
+    message_id: str,
+) -> bool:
+    """
+    Prevent the same WhatsApp message
+    from being processed more than once.
+    """
+
+    if not message_id:
+        return False
+
+    if message_id in PROCESSED_MESSAGE_IDS:
+        return True
+
+    PROCESSED_MESSAGE_IDS.add(
+        message_id
+    )
+
+    # Keep memory bounded.
+    if len(PROCESSED_MESSAGE_IDS) > 5000:
+
+        # Simple cleanup.
+        PROCESSED_MESSAGE_IDS.clear()
+
+        # Keep current message marked as processed.
+        PROCESSED_MESSAGE_IDS.add(
+            message_id
+        )
+
+    return False
+
+
+# ============================================================
+# CUSTOMER MESSAGE HANDLER
 # ============================================================
 
 async def handle_customer_message(
@@ -612,26 +710,39 @@ async def handle_customer_message(
     user_message: str,
 ) -> Optional[str]:
     """
-    Complete customer conversation flow.
+    Complete customer -> AI -> response flow.
 
     Flow:
 
-    Customer message
-          ↓
-    Customer memory update
-          ↓
-    Lead update
-          ↓
-    Recent history
-          ↓
-    AI response
-          ↓
-    Save AI response
-          ↓
-    Return response
+        Customer
+            ↓
+        Customer Memory
+            ↓
+        Chat History
+            ↓
+        Lead Detection
+            ↓
+        AI Agent
+            ↓
+        Save Assistant Reply
+            ↓
+        Return Reply
     """
 
+    sender_phone = normalize_customer_phone(
+        sender_phone
+    )
+
+    user_message = (
+        user_message or ""
+    ).strip()
+
     if not sender_phone:
+
+        logger.error(
+            "Customer phone is missing."
+        )
+
         return None
 
     if not user_message:
@@ -642,71 +753,25 @@ async def handle_customer_message(
     try:
 
         # ====================================================
-        # 1. CUSTOMER MEMORY
+        # 1. LOAD PREVIOUS CONVERSATION
+        # ====================================================
+
+        history = build_chat_history(
+            db=db,
+            sender_phone=sender_phone,
+            limit=HISTORY_LIMIT,
+        )
+
+        # ====================================================
+        # 2. UPDATE CUSTOMER MEMORY
         # ====================================================
 
         customer_memory = (
             process_customer_memory(
-                sender_phone,
-                user_message,
+                sender_phone=sender_phone,
+                user_message=user_message,
             )
         )
-
-        logger.info(
-            "Customer memory updated for %s: %s",
-            sender_phone,
-            customer_memory,
-        )
-
-        # ====================================================
-        # 2. LEAD INFORMATION
-        # ====================================================
-
-        lead_data = extract_lead_info(
-            user_message
-        )
-
-        if is_potential_lead(
-            user_message
-        ):
-            try:
-
-                update_or_create_lead(
-                    db,
-                    sender_phone,
-                    lead_data,
-                )
-
-            except Exception as exc:
-
-                logger.exception(
-                    "Lead update failed: %s",
-                    exc,
-                )
-
-                db.rollback()
-
-        # ====================================================
-        # 3. RECENT CONVERSATION HISTORY
-        # ====================================================
-
-        history = build_chat_history(
-            db,
-            sender_phone,
-            HISTORY_LIMIT,
-        )
-
-        # ====================================================
-        # 4. DETECT AGENT
-        # ====================================================
-
-        agent_name = detect_agent(
-            user_message
-        )
-
-        # ====================================================
-        # 5. CUSTOMER MEMORY → AI CONTEXT
-        # ====================================================
 
         customer_context = (
             memory_to_text(
@@ -715,7 +780,61 @@ async def handle_customer_message(
         )
 
         # ====================================================
-        # 6. GENERATE AI RESPONSE
+        # 3. DETECT AGENT
+        # ====================================================
+
+        agent_name = detect_agent(
+            user_message
+        )
+
+        if not agent_name:
+            agent_name = "sales"
+
+        # ====================================================
+        # 4. EXTRACT LEAD INFORMATION
+        # ====================================================
+
+        lead_data = extract_lead_info(
+            user_message
+        )
+
+        # ====================================================
+        # 5. SAVE CUSTOMER MESSAGE
+        # ====================================================
+
+        save_message(
+            db=db,
+            sender_phone=sender_phone,
+            content=user_message,
+            agent_name=agent_name,
+            sender_type="user",
+        )
+
+        # ====================================================
+        # 6. CREATE / UPDATE LEAD
+        # ====================================================
+
+        has_lead_data = any(
+            value
+            for value in lead_data.values()
+            if value
+        )
+
+        if (
+            is_potential_lead(
+                user_message
+            )
+            or has_lead_data
+        ):
+
+            update_or_create_lead(
+                db=db,
+                sender_phone=sender_phone,
+                lead_data=lead_data,
+            )
+
+        # ====================================================
+        # 7. GENERATE AI RESPONSE
         # ====================================================
 
         reply = await generate_agent_reply(
@@ -728,22 +847,18 @@ async def handle_customer_message(
 
         if not reply:
 
-            reply = (
-                "Thoda technical issue aa gaya hai. "
-                "Ek baar phir message kar dijiye."
+            logger.error(
+                "AI agent returned empty reply."
             )
 
-        # ====================================================
-        # 7. SAVE CUSTOMER MESSAGE
-        # ====================================================
+            return None
 
-        save_message(
-            db=db,
-            sender_phone=sender_phone,
-            content=user_message,
-            agent_name=agent_name,
-            sender_type="user",
-        )
+        reply = str(
+            reply
+        ).strip()
+
+        if not reply:
+            return None
 
         # ====================================================
         # 8. SAVE AI RESPONSE
@@ -766,97 +881,59 @@ async def handle_customer_message(
             exc,
         )
 
-        db.rollback()
-
-        return (
-            "Sorry, thoda technical issue aa gaya hai. "
-            "Please ek baar phir message kar dijiye."
-        )
+        return None
 
     finally:
 
         db.close()
-        # ============================================================
-# META WHATSAPP WEBHOOK - PART 6 FINAL
+
+
+# ============================================================
+# GREEN-API WEBHOOK
 # ============================================================
 
-@router.get("/webhook")
-async def verify_meta_webhook(
-    request: Request,
-):
-    """
-    Meta WhatsApp webhook verification.
-    """
-
-    params = request.query_params
-
-    mode = params.get(
-        "hub.mode"
-    )
-
-    verify_token = params.get(
-        "hub.verify_token"
-    )
-
-    challenge = params.get(
-        "hub.challenge"
-    )
-
-    if (
-        mode == "subscribe"
-        and verify_token == META_VERIFY_TOKEN
-    ):
-        return PlainTextResponse(
-            challenge or ""
-        )
-
-    return PlainTextResponse(
-        "Verification failed",
-        status_code=403,
-    )
-
-
 @router.post("/webhook")
-async def meta_webhook(
+async def whatsapp_webhook(
     request: Request,
 ):
     """
-    Receive incoming WhatsApp messages from Meta.
+    GREEN-API incoming WhatsApp webhook.
 
-    Flow:
-
-        Meta WhatsApp
-              ↓
-        Parse message
-              ↓
-        Duplicate check
-              ↓
-        Customer memory
-              ↓
-        AI response
-              ↓
-        Save messages
-              ↓
-        Send WhatsApp reply
+    GREEN-API
+        ↓
+    parse_whatsapp_message()
+        ↓
+    duplicate check
+        ↓
+    handle_customer_message()
+        ↓
+    send_whatsapp_message()
+        ↓
+    GREEN-API
     """
 
     try:
 
         # ====================================================
-        # 1. READ META WEBHOOK
+        # 1. READ JSON
         # ====================================================
 
         body = await request.json()
 
-        parsed = parse_meta_message(
+        logger.info(
+            "GREEN-API webhook received."
+        )
+
+        # ====================================================
+        # 2. PARSE GREEN-API MESSAGE
+        # ====================================================
+
+        parsed = parse_whatsapp_message(
             body
         )
 
         # ----------------------------------------------------
-        # Ignore:
-        # - status updates
-        # - unsupported message types
-        # - empty messages
+        # Ignore non-incoming-message notifications
         # ----------------------------------------------------
 
         if not parsed:
@@ -866,15 +943,36 @@ async def meta_webhook(
             }
 
         # ====================================================
-        # 2. GET MESSAGE ID
+        # 3. EXTRACT DATA
         # ====================================================
 
         message_id = parsed.get(
-            "message_id"
+            "message_id",
+            "",
         )
 
+        sender_phone = parsed.get(
+            "sender_phone",
+            "",
+        )
+
+        user_message = parsed.get(
+            "message_text",
+            "",
+        )
+
+        if not sender_phone:
+            return {
+                "status": "invalid_sender"
+            }
+
+        if not user_message:
+            return {
+                "status": "invalid_message"
+            }
+
         # ====================================================
-        # 3. DUPLICATE MESSAGE PROTECTION
+        # 4. DUPLICATE PROTECTION
         # ====================================================
 
         if message_id:
@@ -884,7 +982,7 @@ async def meta_webhook(
             ):
 
                 logger.info(
-                    "Duplicate Meta message ignored: %s",
+                    "Duplicate GREEN-API message ignored: %s",
                     message_id,
                 )
 
@@ -893,26 +991,18 @@ async def meta_webhook(
                 }
 
         # ====================================================
-        # 4. GET CUSTOMER + MESSAGE
+        # 5. LOG CUSTOMER MESSAGE
         # ====================================================
 
-        sender_phone = parsed[
-            "sender_phone"
-        ]
-
-        user_message = parsed[
-            "message_text"
-        ]
-
         logger.info(
-            "Incoming Meta WhatsApp message | "
+            "Incoming WhatsApp message | "
             "phone=%s | message=%s",
             sender_phone,
             user_message,
         )
 
         # ====================================================
-        # 5. PROCESS CUSTOMER MESSAGE
+        # 6. AI PROCESSING
         # ====================================================
 
         reply = await handle_customer_message(
@@ -920,14 +1010,10 @@ async def meta_webhook(
             user_message=user_message,
         )
 
-        # ====================================================
-        # 6. NO RESPONSE
-        # ====================================================
-
         if not reply:
 
             logger.warning(
-                "No AI reply generated for %s",
+                "No AI reply generated | phone=%s",
                 sender_phone,
             )
 
@@ -936,23 +1022,22 @@ async def meta_webhook(
             }
 
         # ====================================================
-        # 7. SEND AI RESPONSE TO WHATSAPP
+        # 7. SEND AI REPLY THROUGH GREEN API
         # ====================================================
 
-        sent = await send_meta_whatsapp_message(
+        sent = await send_whatsapp_message(
             recipient_phone=sender_phone,
             message_text=reply,
         )
 
         # ====================================================
-        # 8. MESSAGE SEND FAILED
+        # 8. SEND FAILURE
         # ====================================================
 
         if not sent:
 
             logger.error(
-                "Failed to send Meta WhatsApp reply "
-                "to %s",
+                "GREEN-API reply failed | phone=%s",
                 sender_phone,
             )
 
@@ -966,8 +1051,7 @@ async def meta_webhook(
         # ====================================================
 
         logger.info(
-            "Meta WhatsApp reply sent successfully "
-            "to %s",
+            "GREEN-API AI reply sent successfully | phone=%s",
             sender_phone,
         )
 
@@ -979,392 +1063,220 @@ async def meta_webhook(
     except Exception as exc:
 
         logger.exception(
-            "Meta WhatsApp webhook error: %s",
+            "GREEN-API webhook processing failed: %s",
             exc,
         )
-
-        # ----------------------------------------------------
-        # Return a response instead of crashing the webhook.
-        # ----------------------------------------------------
 
         return {
             "status": "error"
         }
-    # ============================================================
-# TWILIO WHATSAPP WEBHOOK - PART 7
+
+
+# ============================================================
+# TWILIO WHATSAPP WEBHOOK
 # ============================================================
 
-from fastapi.responses import Response
-
-
 @router.post("/incoming")
-async def twilio_incoming(
+async def twilio_whatsapp_webhook(
     request: Request,
 ):
     """
-    Twilio WhatsApp webhook.
+    Existing Twilio WhatsApp webhook.
 
-    Twilio se incoming message receive karke
-    same customer-memory + AI flow use karta hai.
+    IMPORTANT:
+    Twilio is preserved as an optional/secondary flow.
+
+    GREEN-API is the primary WhatsApp flow
+    through /webhook.
     """
 
     try:
 
+        # ----------------------------------------------------
+        # Twilio sends form data
+        # ----------------------------------------------------
+
         form = await request.form()
 
-        sender = str(
-            form.get(
-                "From",
-                "",
-            )
-        ).strip()
-
-        user_message = str(
-            form.get(
-                "Body",
-                "",
-            )
-        ).strip()
-
-        if not sender:
-            return Response(
-                content="",
-                media_type="text/xml",
-            )
-
-        if not user_message:
-            return Response(
-                content="",
-                media_type="text/xml",
-            )
-
-        # ----------------------------------------------------
-        # Twilio sender format:
-        #
-        # whatsapp:+919876543210
-        #
-        # Our memory system needs a stable customer key.
-        # ----------------------------------------------------
-
-        sender_phone = sender
-
-        if sender_phone.startswith(
-            "whatsapp:"
-        ):
-            sender_phone = (
-                sender_phone[
-                    len("whatsapp:") :
-                ]
-            )
-
-        logger.info(
-            "Incoming Twilio message from %s: %s",
-            sender_phone,
-            user_message,
+        sender = form.get(
+            "From",
+            "",
         )
 
+        body = form.get(
+            "Body",
+            "",
+        )
+
+        sender = str(
+            sender or ""
+        ).strip()
+
+        body = str(
+            body or ""
+        ).strip()
+
         # ----------------------------------------------------
-        # Generate AI response
+        # Remove Twilio WhatsApp prefix
+        #
+        # whatsapp:+919876543210
+        # ->
+        # +919876543210
+        # ----------------------------------------------------
+
+        if sender.startswith(
+            "whatsapp:"
+        ):
+
+            sender = sender[
+                len("whatsapp:"):
+            ]
+
+        sender_phone = (
+            normalize_customer_phone(
+                sender
+            )
+        )
+
+        if not sender_phone:
+            return PlainTextResponse(
+                "Invalid sender",
+                status_code=400,
+            )
+
+        if not body:
+            return PlainTextResponse(
+                "Empty message",
+                status_code=400,
+            )
+
+        # ----------------------------------------------------
+        # Process through same AI engine
         # ----------------------------------------------------
 
         reply = await handle_customer_message(
             sender_phone=sender_phone,
-            user_message=user_message,
+            user_message=body,
         )
 
         if not reply:
             reply = (
-                "Sorry, thoda technical issue aa gaya hai."
+                "Dhanyavaad! "
+                "Hamari team aapko jald "
+                "contact karegi."
             )
 
         # ----------------------------------------------------
-        # Twilio XML response
+        # Twilio expects TwiML
         # ----------------------------------------------------
 
-        escaped_reply = (
-            reply
+        safe_reply = (
+            str(reply)
             .replace("&", "&amp;")
             .replace("<", "&lt;")
             .replace(">", "&gt;")
-            .replace('"', "&quot;")
-            .replace("'", "&apos;")
         )
 
         twiml = (
             '<?xml version="1.0" encoding="UTF-8"?>'
             "<Response>"
-            f"<Message>{escaped_reply}</Message>"
+            f"<Message>{safe_reply}</Message>"
             "</Response>"
         )
 
-        return Response(
+        return PlainTextResponse(
             content=twiml,
-            media_type="text/xml",
+            media_type="application/xml",
         )
 
     except Exception as exc:
 
         logger.exception(
-            "Twilio webhook error: %s",
+            "Twilio WhatsApp webhook failed: %s",
             exc,
         )
 
-        return Response(
-            content=(
-                '<?xml version="1.0" encoding="UTF-8"?>'
-                "<Response></Response>"
-            ),
-            media_type="text/xml",
+        return PlainTextResponse(
+            "Internal server error",
+            status_code=500,
         )
-    # ============================================================
-# FINAL CHAT ROUTE HELPERS - PART 8
+
+
+# ============================================================
+# HEALTH CHECK
+# ============================================================
+
+@router.get("/health")
+async def chat_health():
+    """
+    Health check for chat service.
+    """
+
+    return {
+        "status": "ok",
+        "service": "Xytralyn WhatsApp AI",
+        "green_api": bool(
+            GREEN_API_INSTANCE_ID
+            and GREEN_API_TOKEN
+        ),
+        "twilio": bool(
+            TWILIO_ACCOUNT_SID
+            and TWILIO_AUTH_TOKEN
+            and TWILIO_WHATSAPP_FROM
+        ),
+    }
+
+
+# ============================================================
+# DEBUG CUSTOMER MEMORY
+# ============================================================
+
+@router.get(
+    "/debug/customer/{phone}"
+)
+async def debug_customer(
+    phone: str,
+):
+    """
+    Development-only customer memory check.
+
+    Remove or protect this endpoint before
+    production if it exposes sensitive information.
+    """
+
+    normalized_phone = (
+        normalize_customer_phone(
+            phone
+        )
+    )
+
+    return {
+        "phone": normalized_phone,
+        "memory": get_customer_memory(
+            normalized_phone
+        ),
+    }
+
+
+# ============================================================
+# CLEAR CUSTOMER MEMORY
 # ============================================================
 
 def clear_customer_memory(
     sender_phone: str,
 ) -> None:
     """
-    Clear only one customer's temporary memory.
+    Clear temporary in-process memory
+    for one customer.
     """
 
-    if not sender_phone:
-        return
-
-    CUSTOMER_MEMORY.pop(
-        sender_phone,
-        None,
-    )
-
-
-def get_customer_debug_info(
-    sender_phone: str,
-) -> Dict[str, Any]:
-    """
-    Useful for local debugging/testing.
-    """
-
-    if not sender_phone:
-        return {
-            "phone": None,
-            "memory": {},
-        }
-
-    return {
-        "phone": sender_phone,
-        "memory": get_customer_memory(
-            sender_phone
-        ),
-    }
-# ============================================================
-# DUPLICATE MESSAGE PROTECTION - PART 10
-# ============================================================
-
-PROCESSED_MESSAGE_IDS = set()
-
-
-def is_duplicate_message(
-    message_id: Optional[str],
-) -> bool:
-    """
-    Check whether a Meta/Twilio message was already processed.
-
-    This prevents duplicate AI replies when a webhook is
-    delivered more than once.
-    """
-
-    if not message_id:
-        return False
-
-    if message_id in PROCESSED_MESSAGE_IDS:
-        return True
-
-    PROCESSED_MESSAGE_IDS.add(
-        message_id
-    )
-
-    # Keep memory bounded.
-    if len(PROCESSED_MESSAGE_IDS) > 5000:
-
-        oldest_ids = list(
-            PROCESSED_MESSAGE_IDS
-        )[:1000]
-
-        for old_id in oldest_ids:
-
-            PROCESSED_MESSAGE_IDS.discard(
-                old_id
-            )
-
-    return False
-# ============================================================
-# META MESSAGE PARSER - PART 10A FINAL
-# ============================================================
-
-def parse_meta_message(
-    body: Dict[str, Any],
-) -> Optional[Dict[str, str]]:
-    """
-    Parse incoming Meta WhatsApp webhook payload.
-
-    Extracts:
-
-        message_id
+    sender_phone = normalize_customer_phone(
         sender_phone
-        message_text
+    )
 
-    IMPORTANT:
-        message_id is used by the duplicate protection
-        system to prevent processing the same WhatsApp
-        message more than once.
-    """
+    if sender_phone:
 
-    try:
-
-        # ====================================================
-        # 1. ENTRY
-        # ====================================================
-
-        entries = body.get(
-            "entry",
-            [],
+        CUSTOMER_MEMORY.pop(
+            sender_phone,
+            None,
         )
-
-        if not entries:
-            return None
-
-        # ====================================================
-        # 2. CHANGES
-        # ====================================================
-
-        changes = entries[0].get(
-            "changes",
-            [],
-        )
-
-        if not changes:
-            return None
-
-        # ====================================================
-        # 3. VALUE
-        # ====================================================
-
-        value = changes[0].get(
-            "value",
-            {},
-        )
-
-        # ====================================================
-        # 4. MESSAGES
-        # ====================================================
-
-        messages = value.get(
-            "messages",
-            [],
-        )
-
-        # Status updates normally don't contain
-        # messages, so safely ignore them.
-
-        if not messages:
-            return None
-
-        # ====================================================
-        # 5. FIRST MESSAGE
-        # ====================================================
-
-        message = messages[0]
-
-        # ====================================================
-        # 6. UNIQUE MESSAGE ID
-        # ====================================================
-
-        message_id = (
-            message.get(
-                "id"
-            )
-        )
-
-        # ====================================================
-        # 7. CUSTOMER PHONE
-        # ====================================================
-
-        sender_phone = (
-            message.get(
-                "from"
-            )
-        )
-
-        # ====================================================
-        # 8. MESSAGE TYPE
-        # ====================================================
-
-        message_type = (
-            message.get(
-                "type"
-            )
-        )
-
-        # ----------------------------------------------------
-        # Currently process text messages only.
-        # ----------------------------------------------------
-
-        if message_type != "text":
-            return None
-
-        # ====================================================
-        # 9. TEXT DATA
-        # ====================================================
-
-        text_data = message.get(
-            "text",
-            {},
-        )
-
-        message_text = (
-            text_data.get(
-                "body"
-            )
-        )
-
-        # ====================================================
-        # 10. VALIDATION
-        # ====================================================
-
-        if not sender_phone:
-            return None
-
-        if not message_text:
-            return None
-
-        message_text = (
-            str(message_text)
-            .strip()
-        )
-
-        if not message_text:
-            return None
-
-        # ====================================================
-        # 11. RETURN PARSED MESSAGE
-        # ====================================================
-
-        return {
-            "message_id": (
-                message_id or ""
-            ),
-            "sender_phone": (
-                sender_phone
-            ),
-            "message_text": (
-                message_text
-            ),
-        }
-
-    except Exception as exc:
-
-        logger.exception(
-            "Failed to parse Meta WhatsApp message: %s",
-            exc,
-        )
-
-        return None
