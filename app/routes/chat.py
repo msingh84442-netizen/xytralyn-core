@@ -978,6 +978,16 @@ async def whatsapp_webhook(
         body = await request.json()
 
         logger.warning(
+            "XYTRALYN DEBUG PAYLOAD KEYS | keys=%s",
+            list(body.keys()) if isinstance(body, dict) else type(body).__name__,
+        )
+
+        logger.warning(
+            "XYTRALYN DEBUG BODY TYPE | type=%s",
+            type(body).__name__,
+        )
+
+        logger.warning(
             "XYTRALYN DEBUG 2 | JSON received | webhook_type=%s",
             body.get("typeWebhook"),
         )
