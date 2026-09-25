@@ -775,7 +775,7 @@ async def handle_customer_message(
         reply = await generate_agent_reply(
             user_message=user_message,
             history=history,
-            customer_context=customer_context,
+            customer_memory=customer_context,
             agent_name=agent_name,
             business_name=BUSINESS_NAME,
         )
