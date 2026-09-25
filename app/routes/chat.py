@@ -957,51 +957,70 @@ async def whatsapp_webhook(
     """
     GREEN-API incoming WhatsApp webhook.
 
-    GREEN-API
-        ↓
-    parse_whatsapp_message()
-        ↓
-    duplicate check
-        ↓
-    handle_customer_message()
-        ↓
-    send_whatsapp_message()
-        ↓
-    GREEN-API
+    Diagnostic version:
+    Tracks exactly where the message flow stops.
     """
 
     try:
 
         # ====================================================
-        # 1. READ JSON
+        # 1. WEBHOOK RECEIVED
+        # ====================================================
+
+        logger.warning(
+            "XYTRALYN DEBUG 1 | GREEN-API webhook received"
+        )
+
+        # ====================================================
+        # 2. READ JSON
         # ====================================================
 
         body = await request.json()
 
-        logger.info(
-            "GREEN-API webhook received."
+        logger.warning(
+            "XYTRALYN DEBUG 2 | JSON received | webhook_type=%s",
+            body.get("typeWebhook"),
         )
 
         # ====================================================
-        # 2. PARSE GREEN-API MESSAGE
+        # 3. CHECK MESSAGE TYPE
+        # ====================================================
+
+        message_data = body.get(
+            "messageData",
+            {},
+        ) or {}
+
+        logger.warning(
+            "XYTRALYN DEBUG 3 | message_type=%s",
+            message_data.get("typeMessage"),
+        )
+
+        # ====================================================
+        # 4. PARSE MESSAGE
         # ====================================================
 
         parsed = parse_whatsapp_message(
             body
         )
 
-        # ----------------------------------------------------
-        # Ignore non-incoming-message notifications
-        # ----------------------------------------------------
-
         if not parsed:
 
+            logger.warning(
+                "XYTRALYN DEBUG 4 | PARSER RETURNED NONE"
+            )
+
             return {
-                "status": "ignored"
+                "status": "ignored",
+                "reason": "parser_returned_none",
             }
 
+        logger.warning(
+            "XYTRALYN DEBUG 4 | MESSAGE PARSED SUCCESSFULLY"
+        )
+
         # ====================================================
-        # 3. EXTRACT DATA
+        # 5. EXTRACT DATA
         # ====================================================
 
         message_id = parsed.get(
@@ -1019,18 +1038,34 @@ async def whatsapp_webhook(
             "",
         )
 
+        logger.warning(
+            "XYTRALYN DEBUG 5 | sender=%s | message_length=%s",
+            sender_phone,
+            len(user_message),
+        )
+
         if not sender_phone:
+
+            logger.warning(
+                "XYTRALYN DEBUG 5A | INVALID SENDER"
+            )
+
             return {
                 "status": "invalid_sender"
             }
 
         if not user_message:
+
+            logger.warning(
+                "XYTRALYN DEBUG 5B | EMPTY MESSAGE"
+            )
+
             return {
                 "status": "invalid_message"
             }
 
         # ====================================================
-        # 4. DUPLICATE PROTECTION
+        # 6. DUPLICATE CHECK
         # ====================================================
 
         if message_id:
@@ -1039,49 +1074,57 @@ async def whatsapp_webhook(
                 message_id
             ):
 
-                logger.info(
-                    "Duplicate GREEN-API message ignored: %s",
-                    message_id,
+                logger.warning(
+                    "XYTRALYN DEBUG 6 | DUPLICATE MESSAGE"
                 )
 
                 return {
                     "status": "duplicate_ignored"
                 }
 
-        # ====================================================
-        # 5. LOG CUSTOMER MESSAGE
-        # ====================================================
-
-        logger.info(
-            "Incoming WhatsApp message | "
-            "phone=%s | message=%s",
-            sender_phone,
-            user_message,
+        logger.warning(
+            "XYTRALYN DEBUG 6 | DUPLICATE CHECK PASSED"
         )
 
         # ====================================================
-        # 6. AI PROCESSING
+        # 7. AI PROCESSING
         # ====================================================
+
+        logger.warning(
+            "XYTRALYN DEBUG 7 | STARTING AI PROCESSING"
+        )
 
         reply = await handle_customer_message(
             sender_phone=sender_phone,
             user_message=user_message,
         )
 
+        # ====================================================
+        # 8. AI REPLY CHECK
+        # ====================================================
+
         if not reply:
 
-            logger.warning(
-                "No AI reply generated | phone=%s",
-                sender_phone,
+            logger.error(
+                "XYTRALYN DEBUG 8 | AI RETURNED EMPTY REPLY"
             )
 
             return {
                 "status": "no_reply"
             }
 
+        logger.warning(
+            "XYTRALYN DEBUG 8 | AI REPLY GENERATED | length=%s",
+            len(str(reply)),
+        )
+
         # ====================================================
-        # 7. SEND AI REPLY THROUGH GREEN API
+        # 9. SEND THROUGH GREEN API
         # ====================================================
+
+        logger.warning(
+            "XYTRALYN DEBUG 9 | SENDING REPLY THROUGH GREEN-API"
+        )
 
         sent = await send_whatsapp_message(
             recipient_phone=sender_phone,
@@ -1089,14 +1132,13 @@ async def whatsapp_webhook(
         )
 
         # ====================================================
-        # 8. SEND FAILURE
+        # 10. SEND RESULT
         # ====================================================
 
         if not sent:
 
             logger.error(
-                "GREEN-API reply failed | phone=%s",
-                sender_phone,
+                "XYTRALYN DEBUG 10 | GREEN-API SEND FAILED"
             )
 
             return {
@@ -1104,13 +1146,16 @@ async def whatsapp_webhook(
                 "message_sent": False,
             }
 
+        logger.warning(
+            "XYTRALYN DEBUG 10 | GREEN-API SEND SUCCESS"
+        )
+
         # ====================================================
-        # 9. SUCCESS
+        # 11. SUCCESS
         # ====================================================
 
-        logger.info(
-            "GREEN-API AI reply sent successfully | phone=%s",
-            sender_phone,
+        logger.warning(
+            "XYTRALYN DEBUG 11 | XYTRALYN AI FLOW COMPLETED"
         )
 
         return {
@@ -1121,14 +1166,15 @@ async def whatsapp_webhook(
     except Exception as exc:
 
         logger.exception(
-            "GREEN-API webhook processing failed: %s",
+            "XYTRALYN DEBUG ERROR | webhook processing failed: %s",
             exc,
         )
 
-        return {
-            "status": "error"
-        }
-
+        # Temporary diagnostic response
+        return PlainTextResponse(
+            "Webhook processing failed",
+            status_code=500,
+        )
 
 # ============================================================
 # TWILIO WHATSAPP WEBHOOK
