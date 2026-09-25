@@ -558,26 +558,36 @@ def parse_whatsapp_message(
     body: Dict[str, Any],
 ) -> Optional[Dict[str, str]]:
     """
-    Parse incoming GREEN-API text message.
+    Parse incoming GREEN-API WhatsApp messages.
+
+    Supports:
+    - textMessage
+    - extendedTextMessage
     """
 
     try:
 
-        if body.get(
-            "typeWebhook"
-        ) != "incomingMessageReceived":
-
+        # ----------------------------------------------------
+        # 1. Only process incoming messages
+        # ----------------------------------------------------
+        if body.get("typeWebhook") != "incomingMessageReceived":
             return None
 
+        # ----------------------------------------------------
+        # 2. Message ID
+        # ----------------------------------------------------
         message_id = body.get(
             "idMessage",
             "",
         )
 
+        # ----------------------------------------------------
+        # 3. Sender data
+        # ----------------------------------------------------
         sender_data = body.get(
             "senderData",
             {},
-        )
+        ) or {}
 
         chat_id = sender_data.get(
             "chatId",
@@ -587,31 +597,69 @@ def parse_whatsapp_message(
         if not chat_id:
             return None
 
-        # Ignore WhatsApp groups
+        # ----------------------------------------------------
+        # 4. Ignore WhatsApp groups
+        # ----------------------------------------------------
         if "@g.us" in chat_id:
             return None
 
+        # ----------------------------------------------------
+        # 5. Message data
+        # ----------------------------------------------------
         message_data = body.get(
             "messageData",
             {},
-        )
+        ) or {}
 
-        if message_data.get(
-            "typeMessage"
-        ) != "textMessage":
-
-            return None
-
-        text_data = message_data.get(
-            "textMessageData",
-            {},
-        )
-
-        message_text = text_data.get(
-            "textMessage",
+        message_type = message_data.get(
+            "typeMessage",
             "",
         )
 
+        # ----------------------------------------------------
+        # 6. Extract message text
+        # ----------------------------------------------------
+        message_text = ""
+
+        # Normal text message
+        if message_type == "textMessage":
+
+            text_data = message_data.get(
+                "textMessageData",
+                {},
+            ) or {}
+
+            message_text = text_data.get(
+                "textMessage",
+                "",
+            )
+
+        # Extended text message
+        elif message_type == "extendedTextMessage":
+
+            extended_data = message_data.get(
+                "extendedTextMessageData",
+                {},
+            ) or {}
+
+            message_text = extended_data.get(
+                "text",
+                "",
+            )
+
+        # Unsupported message type
+        else:
+
+            logger.info(
+                "GREEN-API message ignored | type=%s",
+                message_type,
+            )
+
+            return None
+
+        # ----------------------------------------------------
+        # 7. Validate message text
+        # ----------------------------------------------------
         if not message_text:
             return None
 
@@ -622,19 +670,29 @@ def parse_whatsapp_message(
         if not message_text:
             return None
 
+        # ----------------------------------------------------
+        # 8. Extract sender phone
+        # ----------------------------------------------------
         sender_phone = chat_id.split(
             "@",
             1,
         )[0]
 
-        sender_phone = (
-            normalize_customer_phone(
-                sender_phone
-            )
+        sender_phone = normalize_customer_phone(
+            sender_phone
         )
 
         if not sender_phone:
             return None
+
+        # ----------------------------------------------------
+        # 9. Return normalized message
+        # ----------------------------------------------------
+        logger.info(
+            "GREEN-API incoming message | type=%s | phone=%s",
+            message_type,
+            sender_phone,
+        )
 
         return {
             "message_id": str(
