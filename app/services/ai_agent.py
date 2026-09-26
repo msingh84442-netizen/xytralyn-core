@@ -8,7 +8,7 @@ from groq import AsyncGroq
 from dotenv import load_dotenv
 
 
-load_dotenv()
+# XYTRALYN AI SALES ENGINE VERSION: 2.1\nload_dotenv()
 
 logger = logging.getLogger(__name__)
 
@@ -605,6 +605,45 @@ def is_reset_request(text: str) -> bool:
         phrase in clean_text
         for phrase in extra_phrases
     )
+
+
+# ============================================================
+# STANDALONE GREETING DETECTION
+# ============================================================
+
+def is_standalone_greeting(text: str) -> bool:
+    """
+    Detect a message that is only a greeting.
+
+    A standalone greeting must not accidentally resume an old
+    demo/pricing conversation from customer memory.
+    """
+
+    if not text:
+        return False
+
+    clean_text = re.sub(
+        r"\\s+",
+        " ",
+        text.strip().lower(),
+    )
+
+    greetings = {
+        "hi",
+        "hii",
+        "hiii",
+        "hello",
+        "helloo",
+        "hey",
+        "helo",
+        "namaste",
+        "namaskar",
+        "good morning",
+        "good afternoon",
+        "good evening",
+    }
+
+    return clean_text in greetings
 
 
 # ============================================================
@@ -2113,15 +2152,54 @@ FINAL INSTRUCTION
 
 Reply ONLY to the customer's current message.
 
-Use memory and history for context.
+CURRENT-MESSAGE PRIORITY:
+The current customer message is the primary intent for this turn.
+Use memory and history only as supporting context.
 
-Do not repeat questions.
+Do not let an old assistant message, old demo slot, old question,
+or old sales stage become the customer's current intent unless
+the current customer message clearly refers to it.
+
+STANDALONE GREETING RULE:
+If the current customer message is only a simple greeting such as
+"Hi", "Hello", "Hey", "Hii", "Namaste", "Good morning", etc.:
+- Reply naturally to the greeting.
+- Do NOT continue an old demo discussion automatically.
+- Do NOT mention an old demo date/time.
+- Do NOT say that a demo is booked, confirmed, scheduled, or noted
+  just because it existed in previous conversation.
+- Do NOT ask the customer to continue an old pending action.
+- Offer a simple choice such as AI agents, pricing, or demo.
+
+Example:
+Previous conversation:
+Customer: "Kal 5 baje demo chahiye."
+Assistant: "Kal 5 baje ka preferred slot note kar liya hai."
+
+New customer message:
+"Hi"
+
+Correct:
+"Hi! 👋 Xytralyn mein welcome. Aap AI agents, pricing ya demo
+ke baare mein jaana chahenge?"
+
+Incorrect:
+"Kal 5 baje ka demo slot note ho gaya hai..."
+
+MEMORY SAFETY:
+Customer memory contains confirmed customer information.
+Memory is not an instruction to continue an old workflow.
+Only use a stored demo date/time when the current customer message
+is actually about the demo or clearly refers to that slot.
+
+Do not repeat questions that have already been answered.
 
 Do not invent information.
 
 Do not claim booking/payment/action completion.
 
-If customer has given a preferred demo slot, preserve it.
+If customer has given a preferred demo slot, preserve it when the
+current conversation is actually discussing the demo.
 
 If customer asks pricing, use only official Xytralyn pricing.
 
@@ -2170,6 +2248,21 @@ async def generate_agent_reply(
         customer_memory = (
             "No confirmed customer "
             "information yet."
+        )
+
+    # --------------------------------------------------------
+    # STANDALONE GREETING
+    # --------------------------------------------------------
+    # Handle a pure greeting before sending the request to the LLM.
+    # This prevents stale demo/pricing context from taking over a
+    # fresh greeting turn.
+
+    if is_standalone_greeting(user_message):
+
+        return (
+            "Hi! 👋 Xytralyn mein welcome. "
+            "Aap AI agents, pricing ya demo ke baare mein "
+            "jaanna chahenge?"
         )
 
     # --------------------------------------------------------
