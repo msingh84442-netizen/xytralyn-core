@@ -25,6 +25,8 @@ from app.services.ai_agent import (
     normalize_history,
     merge_customer_memory,
     memory_to_text,
+    is_valid_customer_name,
+    is_valid_memory_value,
 )
 
 logger = logging.getLogger(__name__)
@@ -85,6 +87,28 @@ def normalize_customer_phone(
     return digits
 
 
+def sanitize_customer_memory_data(
+    data: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Keep only confirmed, non-placeholder customer data."""
+
+    if not isinstance(data, dict):
+        return {}
+
+    cleaned = {}
+
+    for field, value in data.items():
+        if not is_valid_memory_value(value):
+            continue
+
+        if field == "name" and not is_valid_customer_name(value):
+            continue
+
+        cleaned[field] = value
+
+    return cleaned
+
+
 # ============================================================
 # CUSTOMER MEMORY
 # ============================================================
@@ -103,16 +127,12 @@ def get_customer_memory(
     try:
         lead = (
             db.query(Lead)
-            .filter(
-                Lead.phone == phone
-            )
+            .filter(Lead.phone == phone)
             .first()
         )
 
         if not lead:
             return {}
-
-        memory = {}
 
         fields = [
             "name",
@@ -127,19 +147,40 @@ def get_customer_memory(
             "demo_status",
         ]
 
+        raw_memory = {}
+        changed = False
+
         for field in fields:
-            value = getattr(
-                lead,
-                field,
-                None,
-            )
+            value = getattr(lead, field, None)
 
-            if value:
-                memory[field] = value
+            if not is_valid_memory_value(value):
+                # Remove stale placeholder values from the database.
+                if value not in (None, "") and field != "demo_status":
+                    try:
+                        setattr(lead, field, None)
+                        changed = True
+                    except Exception:
+                        pass
+                continue
 
-        return memory
+            if field == "name" and not is_valid_customer_name(value):
+                try:
+                    lead.name = None
+                    changed = True
+                except Exception:
+                    pass
+                continue
+
+            raw_memory[field] = value
+
+        if changed:
+            db.commit()
+            db.refresh(lead)
+
+        return sanitize_customer_memory_data(raw_memory)
 
     except Exception as exc:
+        db.rollback()
         logger.exception(
             "Failed to load customer memory: %s",
             exc,
@@ -160,16 +201,14 @@ def update_customer_memory(
     if not phone:
         return {}
 
-    new_data = new_data or {}
+    new_data = sanitize_customer_memory_data(new_data or {})
 
     db = SessionLocal()
 
     try:
         lead = (
             db.query(Lead)
-            .filter(
-                Lead.phone == phone
-            )
+            .filter(Lead.phone == phone)
             .first()
         )
 
@@ -179,7 +218,6 @@ def update_customer_memory(
                 status="new",
                 demo_status="not_scheduled",
             )
-
             db.add(lead)
             db.flush()
 
@@ -197,13 +235,13 @@ def update_customer_memory(
 
         for field in fields:
             value = new_data.get(field)
+            if not is_valid_memory_value(value):
+                continue
 
-            if value:
-                setattr(
-                    lead,
-                    field,
-                    value,
-                )
+            if field == "name" and not is_valid_customer_name(value):
+                continue
+
+            setattr(lead, field, value)
 
         if (
             new_data.get("demo_date")
@@ -212,42 +250,25 @@ def update_customer_memory(
         ):
             lead.demo_status = "preferred_slot"
 
+        # Clean old placeholder identity values even if this turn
+        # did not contain a new name/company.
+        if not is_valid_customer_name(getattr(lead, "name", None)):
+            lead.name = None
+
+        if not is_valid_memory_value(getattr(lead, "company", None)):
+            lead.company = None
+
         db.commit()
         db.refresh(lead)
 
-        memory = {}
-
-        for field in [
-            "name",
-            "email",
-            "company",
-            "business_type",
-            "lead_volume",
-            "interested_agent",
-            "demo_date",
-            "demo_time",
-            "demo_datetime",
-            "demo_status",
-        ]:
-            value = getattr(
-                lead,
-                field,
-                None,
-            )
-
-            if value:
-                memory[field] = value
-
-        return memory
+        return get_customer_memory(phone)
 
     except Exception as exc:
         db.rollback()
-
         logger.exception(
             "Failed to save customer memory: %s",
             exc,
         )
-
         return {}
 
     finally:
@@ -412,14 +433,14 @@ def update_or_create_lead(
     if not sender_phone:
         return None
 
+    lead_data = sanitize_customer_memory_data(lead_data or {})
+
     if not lead_data:
         return None
 
     lead = (
         db.query(Lead)
-        .filter(
-            Lead.phone == sender_phone
-        )
+        .filter(Lead.phone == sender_phone)
         .first()
     )
 
@@ -446,36 +467,26 @@ def update_or_create_lead(
             ),
             status="new",
         )
-
         db.add(lead)
 
     else:
-        if lead_data.get("name"):
-            lead.name = lead_data["name"]
-
-        if lead_data.get("email"):
-            lead.email = lead_data["email"]
-
-        if lead_data.get("company"):
-            lead.company = lead_data["company"]
-
-        if lead_data.get("business_type"):
-            lead.business_type = lead_data["business_type"]
-
-        if lead_data.get("lead_volume"):
-            lead.lead_volume = lead_data["lead_volume"]
-
-        if lead_data.get("interested_agent"):
-            lead.interested_agent = lead_data["interested_agent"]
-
-        if lead_data.get("demo_date"):
-            lead.demo_date = lead_data["demo_date"]
-
-        if lead_data.get("demo_time"):
-            lead.demo_time = lead_data["demo_time"]
-
-        if lead_data.get("demo_datetime"):
-            lead.demo_datetime = lead_data["demo_datetime"]
+        for field in [
+            "name",
+            "email",
+            "company",
+            "business_type",
+            "lead_volume",
+            "interested_agent",
+            "demo_date",
+            "demo_time",
+            "demo_datetime",
+        ]:
+            value = lead_data.get(field)
+            if not is_valid_memory_value(value):
+                continue
+            if field == "name" and not is_valid_customer_name(value):
+                continue
+            setattr(lead, field, value)
 
         if (
             lead_data.get("demo_date")
@@ -484,9 +495,14 @@ def update_or_create_lead(
         ):
             lead.demo_status = "preferred_slot"
 
+        if not is_valid_customer_name(getattr(lead, "name", None)):
+            lead.name = None
+
+        if not is_valid_memory_value(getattr(lead, "company", None)):
+            lead.company = None
+
     db.commit()
     db.refresh(lead)
-
     return lead
 
 
@@ -1255,24 +1271,65 @@ async def clear_customer_memory(
     phone: str,
 ):
 
-    normalized_phone = (
-        normalize_customer_phone(
-            phone
+    normalized_phone = normalize_customer_phone(phone)
+
+    if not normalized_phone:
+        return {
+            "status": "invalid_phone",
+            "phone": normalized_phone,
+        }
+
+    db = SessionLocal()
+
+    try:
+        lead = (
+            db.query(Lead)
+            .filter(Lead.phone == normalized_phone)
+            .first()
         )
-    )
 
-    if normalized_phone in CUSTOMER_MEMORY:
+        if not lead:
+            return {
+                "status": "not_found",
+                "phone": normalized_phone,
+            }
 
-        del CUSTOMER_MEMORY[
-            normalized_phone
-        ]
+        # Clear customer memory while preserving the lead record.
+        for field in [
+            "name",
+            "email",
+            "company",
+            "business_type",
+            "lead_volume",
+            "interested_agent",
+            "demo_date",
+            "demo_time",
+            "demo_datetime",
+        ]:
+            if hasattr(lead, field):
+                setattr(lead, field, None)
+
+        if hasattr(lead, "demo_status"):
+            lead.demo_status = "not_scheduled"
+
+        db.commit()
 
         return {
             "status": "cleared",
             "phone": normalized_phone,
+            "memory": {},
         }
 
-    return {
-        "status": "not_found",
-        "phone": normalized_phone,
-    }
+    except Exception as exc:
+        db.rollback()
+        logger.exception(
+            "Failed to clear customer memory: %s",
+            exc,
+        )
+        return {
+            "status": "error",
+            "phone": normalized_phone,
+        }
+
+    finally:
+        db.close()

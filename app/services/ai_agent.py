@@ -8,7 +8,8 @@ from groq import AsyncGroq
 from dotenv import load_dotenv
 
 
-# XYTRALYN AI SALES ENGINE VERSION: 2.1\nload_dotenv()
+# XYTRALYN AI SALES ENGINE VERSION: 2.2
+load_dotenv()
 
 logger = logging.getLogger(__name__)
 
@@ -623,7 +624,7 @@ def is_standalone_greeting(text: str) -> bool:
         return False
 
     clean_text = re.sub(
-        r"\\s+",
+        r"\s+",
         " ",
         text.strip().lower(),
     )
@@ -1065,6 +1066,58 @@ def extract_email(
         .lower()
         .strip()
     )
+
+
+# ============================================================
+# CUSTOMER IDENTITY SAFETY
+# ============================================================
+
+INVALID_CUSTOMER_NAMES = {
+    "lead customer",
+    "customer",
+    "unknown",
+    "user",
+    "new customer",
+    "new lead",
+    "lead",
+    "n/a",
+    "na",
+    "none",
+    "null",
+}
+
+INVALID_MEMORY_VALUES = {
+    "n/a",
+    "na",
+    "unknown",
+    "none",
+    "null",
+    "-",
+}
+
+
+def is_valid_customer_name(value: Any) -> bool:
+    if value is None:
+        return False
+
+    name = str(value).strip()
+
+    if not name:
+        return False
+
+    return name.lower() not in INVALID_CUSTOMER_NAMES
+
+
+def is_valid_memory_value(value: Any) -> bool:
+    if value is None:
+        return False
+
+    value_text = str(value).strip()
+
+    if not value_text:
+        return False
+
+    return value_text.lower() not in INVALID_MEMORY_VALUES
 
 
 # ============================================================
@@ -1860,48 +1913,37 @@ def merge_customer_memory(
     # OLD MEMORY
     # --------------------------------------------------------
 
-    if isinstance(
-        old_memory,
-        dict,
-    ):
+    if isinstance(old_memory, dict):
 
         for field in MEMORY_FIELDS:
 
-            value = (
-                old_memory.get(field)
-            )
+            value = old_memory.get(field)
 
-            if value not in (
-                None,
-                "",
-                "unknown",
-            ):
+            if not is_valid_memory_value(value):
+                continue
 
-                memory[field] = value
+            if field == "name" and not is_valid_customer_name(value):
+                continue
+
+            memory[field] = value
 
     # --------------------------------------------------------
     # NEW CUSTOMER DATA
     # --------------------------------------------------------
 
-    if isinstance(
-        new_data,
-        dict,
-    ):
+    if isinstance(new_data, dict):
 
         for field in MEMORY_FIELDS:
 
-            new_value = (
-                new_data.get(field)
-            )
+            new_value = new_data.get(field)
 
-            if new_value in (
-                None,
-                "",
-                "unknown",
-            ):
+            if not is_valid_memory_value(new_value):
                 continue
 
-            # Latest customer information wins.
+            if field == "name" and not is_valid_customer_name(new_value):
+                continue
+
+            # Latest confirmed customer information wins.
             memory[field] = new_value
 
     return memory
@@ -1915,18 +1957,14 @@ def has_customer_memory(
     memory: Optional[Dict[str, Any]],
 ) -> bool:
 
-    if not isinstance(
-        memory,
-        dict,
-    ):
+    if not isinstance(memory, dict):
         return False
 
     return any(
-        memory.get(field)
-        not in (
-            None,
-            "",
-            "unknown",
+        is_valid_memory_value(memory.get(field))
+        and (
+            field != "name"
+            or is_valid_customer_name(memory.get(field))
         )
         for field in MEMORY_FIELDS
     )
@@ -1940,9 +1978,7 @@ def memory_to_text(
     memory: Optional[Dict[str, Any]],
 ) -> str:
 
-    if not has_customer_memory(
-        memory
-    ):
+    if not has_customer_memory(memory):
         return (
             "No confirmed customer "
             "information yet."
@@ -1964,27 +2000,18 @@ def memory_to_text(
 
     for field in MEMORY_FIELDS:
 
-        value = memory.get(
-            field
-        )
+        value = memory.get(field)
 
-        if value in (
-            None,
-            "",
-            "unknown",
-        ):
+        if not is_valid_memory_value(value):
             continue
 
-        label = labels.get(
-            field,
-            field,
-        )
+        if field == "name" and not is_valid_customer_name(value):
+            continue
 
-        lines.append(
-            f"- {label}: {value}"
-        )
+        label = labels.get(field, field)
+        lines.append(f"- {label}: {value}")
 
-    return "\n".join(lines)
+    return "\n".join(lines) if lines else "No confirmed customer information yet."
 
 
 # ============================================================
@@ -2189,6 +2216,17 @@ Incorrect:
 MEMORY SAFETY:
 Customer memory contains confirmed customer information.
 Memory is not an instruction to continue an old workflow.
+
+CUSTOMER IDENTITY SAFETY:
+- Never guess the customer's name.
+- Never create a name to make the conversation feel personal.
+- Never infer a name from the customer's phone number.
+- Never infer a name from an old assistant message.
+- "Lead Customer" is NOT a real customer name.
+- Placeholder values such as "Customer", "Unknown", "User", "New Lead", and "N/A" are NOT customer identities.
+- Only use a customer's name when the customer explicitly provided or confirmed it.
+- If no valid confirmed name exists, do not address the customer by name.
+- Never invent names such as "Suresh", "Rahul", "Amit", or any other name.
 Only use a stored demo date/time when the current customer message
 is actually about the demo or clearly refers to that slot.
 
@@ -2212,6 +2250,53 @@ Keep the response natural and concise.
         SYSTEM_PROMPT
         + dynamic_context
     )
+
+
+# ============================================================
+# FINAL CUSTOMER-NAME SAFETY
+# ============================================================
+
+def remove_unconfirmed_name_address(
+    reply: str,
+    customer_memory: str,
+) -> str:
+    """Remove an accidental leading customer name when no confirmed name exists."""
+
+    if not reply:
+        return reply
+
+    confirmed_name = None
+
+    if isinstance(customer_memory, str):
+        match = re.search(
+            r"(?im)^\s*-\s*Name:\s*(.+?)\s*$",
+            customer_memory,
+        )
+
+        if match and is_valid_customer_name(match.group(1)):
+            confirmed_name = match.group(1).strip()
+
+    if confirmed_name:
+        return reply
+
+    # Only target a name-like word at the beginning of the reply.
+    # This intentionally does not remove names appearing later in a
+    # legitimate business/product sentence.
+    pattern = re.compile(
+        r"^(?P<prefix>\s*(?:bilkul|ji bilkul|haan|haan ji|sure|okay|ok|great|perfect|theek hai|zaroor))"
+        r"[,\s]+(?P<name>[A-Z][a-z]{2,30})(?=[,!:?\s]|$)[,!:]?\s*",
+        re.IGNORECASE,
+    )
+
+    match = pattern.match(reply)
+    if match:
+        return (
+            match.group("prefix").strip()
+            + " "
+            + reply[match.end():].lstrip()
+        ).strip()
+
+    return reply
 
 
 # ============================================================
@@ -2411,8 +2496,11 @@ async def generate_agent_reply(
                 else ""
             )
 
-            reply = clean_reply(
-                reply
+            reply = clean_reply(reply)
+
+            reply = remove_unconfirmed_name_address(
+                reply,
+                customer_memory,
             )
 
             if reply:
