@@ -98,10 +98,56 @@ def get_customer_memory(
     if not phone:
         return {}
 
-    return CUSTOMER_MEMORY.get(
-        phone,
-        {},
-    ).copy()
+    db = SessionLocal()
+
+    try:
+        lead = (
+            db.query(Lead)
+            .filter(
+                Lead.phone == phone
+            )
+            .first()
+        )
+
+        if not lead:
+            return {}
+
+        memory = {}
+
+        fields = [
+            "name",
+            "email",
+            "company",
+            "business_type",
+            "lead_volume",
+            "interested_agent",
+            "demo_date",
+            "demo_time",
+            "demo_datetime",
+            "demo_status",
+        ]
+
+        for field in fields:
+            value = getattr(
+                lead,
+                field,
+                None,
+            )
+
+            if value:
+                memory[field] = value
+
+        return memory
+
+    except Exception as exc:
+        logger.exception(
+            "Failed to load customer memory: %s",
+            exc,
+        )
+        return {}
+
+    finally:
+        db.close()
 
 
 def update_customer_memory(
@@ -114,16 +160,98 @@ def update_customer_memory(
     if not phone:
         return {}
 
-    old_memory = get_customer_memory(phone)
+    new_data = new_data or {}
 
-    updated_memory = merge_customer_memory(
-        old_memory,
-        new_data or {},
-    )
+    db = SessionLocal()
 
-    CUSTOMER_MEMORY[phone] = updated_memory
+    try:
+        lead = (
+            db.query(Lead)
+            .filter(
+                Lead.phone == phone
+            )
+            .first()
+        )
 
-    return updated_memory
+        if not lead:
+            lead = Lead(
+                phone=phone,
+                status="new",
+                demo_status="not_scheduled",
+            )
+
+            db.add(lead)
+            db.flush()
+
+        fields = [
+            "name",
+            "email",
+            "company",
+            "business_type",
+            "lead_volume",
+            "interested_agent",
+            "demo_date",
+            "demo_time",
+            "demo_datetime",
+        ]
+
+        for field in fields:
+            value = new_data.get(field)
+
+            if value:
+                setattr(
+                    lead,
+                    field,
+                    value,
+                )
+
+        if (
+            new_data.get("demo_date")
+            or new_data.get("demo_time")
+            or new_data.get("demo_datetime")
+        ):
+            lead.demo_status = "preferred_slot"
+
+        db.commit()
+        db.refresh(lead)
+
+        memory = {}
+
+        for field in [
+            "name",
+            "email",
+            "company",
+            "business_type",
+            "lead_volume",
+            "interested_agent",
+            "demo_date",
+            "demo_time",
+            "demo_datetime",
+            "demo_status",
+        ]:
+            value = getattr(
+                lead,
+                field,
+                None,
+            )
+
+            if value:
+                memory[field] = value
+
+        return memory
+
+    except Exception as exc:
+        db.rollback()
+
+        logger.exception(
+            "Failed to save customer memory: %s",
+            exc,
+        )
+
+        return {}
+
+    finally:
+        db.close()
 
 
 # ============================================================
@@ -279,9 +407,7 @@ def update_or_create_lead(
     lead_data: Optional[Dict[str, Any]],
 ) -> Optional[Lead]:
 
-    sender_phone = normalize_customer_phone(
-        sender_phone
-    )
+    sender_phone = normalize_customer_phone(sender_phone)
 
     if not sender_phone:
         return None
@@ -298,20 +424,32 @@ def update_or_create_lead(
     )
 
     if not lead:
-
         lead = Lead(
             phone=sender_phone,
             name=lead_data.get("name"),
             email=lead_data.get("email"),
             company=lead_data.get("company"),
+            business_type=lead_data.get("business_type"),
+            lead_volume=lead_data.get("lead_volume"),
+            interested_agent=lead_data.get("interested_agent"),
+            demo_date=lead_data.get("demo_date"),
+            demo_time=lead_data.get("demo_time"),
+            demo_datetime=lead_data.get("demo_datetime"),
+            demo_status=(
+                "preferred_slot"
+                if (
+                    lead_data.get("demo_date")
+                    or lead_data.get("demo_time")
+                    or lead_data.get("demo_datetime")
+                )
+                else "not_scheduled"
+            ),
             status="new",
-            source="whatsapp",
         )
 
         db.add(lead)
 
     else:
-
         if lead_data.get("name"):
             lead.name = lead_data["name"]
 
@@ -320,6 +458,31 @@ def update_or_create_lead(
 
         if lead_data.get("company"):
             lead.company = lead_data["company"]
+
+        if lead_data.get("business_type"):
+            lead.business_type = lead_data["business_type"]
+
+        if lead_data.get("lead_volume"):
+            lead.lead_volume = lead_data["lead_volume"]
+
+        if lead_data.get("interested_agent"):
+            lead.interested_agent = lead_data["interested_agent"]
+
+        if lead_data.get("demo_date"):
+            lead.demo_date = lead_data["demo_date"]
+
+        if lead_data.get("demo_time"):
+            lead.demo_time = lead_data["demo_time"]
+
+        if lead_data.get("demo_datetime"):
+            lead.demo_datetime = lead_data["demo_datetime"]
+
+        if (
+            lead_data.get("demo_date")
+            or lead_data.get("demo_time")
+            or lead_data.get("demo_datetime")
+        ):
+            lead.demo_status = "preferred_slot"
 
     db.commit()
     db.refresh(lead)
