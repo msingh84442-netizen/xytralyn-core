@@ -44,14 +44,12 @@ HISTORY_LIMIT = 20
 # META WHATSAPP CONFIG
 # ============================================================
 
-META_ACCESS_TOKEN = os.getenv("META_ACCESS_TOKEN")
-META_PHONE_NUMBER_ID = os.getenv("META_PHONE_NUMBER_ID")
-META_VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN")
-
-META_GRAPH_VERSION = os.getenv(
-    "META_GRAPH_VERSION",
-    "v26.0",
-)
+META_ACCESS_TOKEN = (os.getenv("META_ACCESS_TOKEN") or "").strip()
+META_PHONE_NUMBER_ID = (os.getenv("META_PHONE_NUMBER_ID") or "").strip()
+META_VERIFY_TOKEN = (os.getenv("META_VERIFY_TOKEN") or "").strip()
+META_GRAPH_VERSION = (
+    os.getenv("META_GRAPH_VERSION") or "v26.0"
+).strip()
 
 
 # ============================================================
@@ -422,10 +420,10 @@ async def send_whatsapp_message(
         return False
 
     url = (
-        f"https://graph.facebook.com/"
-        f"{META_GRAPH_VERSION}/"
-        f"{META_PHONE_NUMBER_ID}/messages"
-    )
+    f"https://graph.facebook.com/"
+    f"{META_GRAPH_VERSION.strip()}/"
+    f"{META_PHONE_NUMBER_ID.strip()}/messages"
+)
 
     headers = {
         "Authorization": (
