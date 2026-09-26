@@ -457,14 +457,24 @@ async def send_whatsapp_message(
                 json=payload,
             )
 
+        # ----------------------------------------------------
+        # SUCCESS
+        # ----------------------------------------------------
+
         if response.is_success:
 
             logger.info(
-                "META WhatsApp message sent | phone=%s",
-                phone_digits,
+                "META WhatsApp send accepted | "
+                "status=%s | response=%s",
+                response.status_code,
+                response.text,
             )
 
             return True
+
+        # ----------------------------------------------------
+        # META API ERROR
+        # ----------------------------------------------------
 
         logger.error(
             "META WhatsApp send failed | "
