@@ -884,20 +884,73 @@ async def handle_customer_message(
             HISTORY_LIMIT,
         )
 
-        # ====================================================
+                # ====================================================
         # 2. UPDATE CUSTOMER MEMORY
         # ====================================================
 
-        customer_memory = (
-            process_customer_memory(
-                sender_phone,
-                user_message,
-            )
+        customer_memory = process_customer_memory(
+            sender_phone,
+            user_message,
         )
 
         customer_context = memory_to_text(
             customer_memory
         )
+
+        # ====================================================
+        # DEMO MEMORY SAFETY
+        # ====================================================
+        # If customer asks for a NEW demo but does not provide
+        # a date/time in the CURRENT message, do not expose an
+        # old demo slot to the AI for this turn.
+
+        (
+            current_demo_date,
+            current_demo_time,
+            current_demo_datetime,
+        ) = extract_demo_datetime(
+            user_message
+        )
+
+        clean_message = user_message.lower().strip()
+
+        is_demo_request = (
+            "demo" in clean_message
+            and any(
+                phrase in clean_message
+                for phrase in [
+                    "demo chahiye",
+                    "mujhe demo",
+                    "demo lena",
+                    "demo karna",
+                    "demo dekhna",
+                    "demo dikhao",
+                    "book demo",
+                    "demo book",
+                ]
+            )
+        )
+
+        if (
+            is_demo_request
+            and not current_demo_date
+            and not current_demo_time
+            and not current_demo_datetime
+        ):
+            customer_memory = {
+                key: value
+                for key, value in customer_memory.items()
+                if key not in {
+                    "demo_date",
+                    "demo_time",
+                    "demo_datetime",
+                    "demo_status",
+                }
+            }
+
+            customer_context = memory_to_text(
+                customer_memory
+            )
 
         # ====================================================
         # 3. AGENT DETECTION

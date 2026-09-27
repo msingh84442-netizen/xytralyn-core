@@ -2349,6 +2349,50 @@ async def generate_agent_reply(
             "Aap AI agents, pricing ya demo ke baare mein "
             "jaanna chahenge?"
         )
+        # --------------------------------------------------------
+    # DEMO REQUEST WITHOUT DATE/TIME
+    # --------------------------------------------------------
+    # If the customer asks for a demo but does NOT provide
+    # a date/time in the current message, do not reuse an old
+    # demo slot from memory or previous conversation.
+    
+    demo_date, demo_time, demo_datetime = extract_demo_datetime(
+        user_message
+    )
+
+    demo_request_words = [
+        "demo chahiye",
+        "demo lena hai",
+        "demo karna hai",
+        "demo dekhna hai",
+        "demo dikhao",
+        "demo dena hai",
+        "mujhe demo",
+        "demo please",
+        "book demo",
+        "demo book",
+    ]
+
+    clean_message = user_message.lower().strip()
+
+    is_demo_request = (
+        "demo" in clean_message
+        and any(
+            phrase in clean_message
+            for phrase in demo_request_words
+        )
+    )
+
+    if (
+        is_demo_request
+        and not demo_date
+        and not demo_time
+        and not demo_datetime
+    ):
+        return (
+            "Bilkul! 🚀 Aapke liye demo arrange kar sakte hain. "
+            "Aapko kaunsa date aur time convenient rahega?"
+        )
 
     # --------------------------------------------------------
     # NORMALIZE HISTORY
