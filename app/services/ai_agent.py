@@ -2297,6 +2297,338 @@ def remove_unconfirmed_name_address(
         ).strip()
 
     return reply
+# ============================================================
+# CONVERSATIONAL SALES ENGINE V3
+# ============================================================
+
+def conversational_sales_reply(
+    user_message: str,
+    history: Optional[List[Dict[str, str]]] = None,
+    customer_memory: str = "",
+) -> Optional[str]:
+    """
+    Deterministic conversation layer.
+
+    Purpose:
+    - Answer simple/current intents directly
+    - Prevent brochure-style replies
+    - Use previous assistant question for short answers
+    - Keep WhatsApp replies short
+    - Ask only one useful follow-up
+    """
+
+    if not user_message:
+        return None
+
+    text = user_message.strip().lower()
+
+    history = normalize_history(
+        history or []
+    )
+
+    # --------------------------------------------------------
+    # LAST ASSISTANT MESSAGE
+    # --------------------------------------------------------
+
+    last_assistant_message = ""
+
+    for item in reversed(history):
+        if item.get("role") == "assistant":
+            last_assistant_message = (
+                item.get("content") or ""
+            ).strip().lower()
+            break
+
+    # --------------------------------------------------------
+    # PRICING — GENERAL
+    # --------------------------------------------------------
+
+    pricing_words = [
+        "pricing",
+        "price",
+        "prices",
+        "cost",
+        "charges",
+        "charge",
+        "kitne ka",
+        "kitna cost",
+        "kitna lagega",
+        "plans",
+        "plan batao",
+        "pricing batao",
+        "price batao",
+    ]
+
+    if any(word in text for word in pricing_words):
+
+        return (
+            "Bilkul 👍\n"
+            "Basic — ₹2,000/month: 1 AI Agent + WhatsApp\n"
+            "Pro — ₹5,000/month: All 5 Agents + CRM + Lead Management\n"
+            "Business — ₹10,000/month: All 5 Agents + Custom Automation + Priority Support\n\n"
+            "Aapka business kis type ka hai?"
+        )
+
+    # --------------------------------------------------------
+    # SPECIFIC PLAN — PRO
+    # --------------------------------------------------------
+
+    if (
+        "pro" in text
+        and any(
+            word in text
+            for word in [
+                "mein kya",
+                "me kya",
+                "kya milega",
+                "features",
+                "feature",
+                "details",
+                "batao",
+            ]
+        )
+    ):
+
+        return (
+            "Pro plan ₹5,000/month ka hai. "
+            "Isme all 5 AI Agents, CRM Dashboard aur Lead Management milta hai. 👍\n\n"
+            "Aapka business kis type ka hai?"
+        )
+
+    # --------------------------------------------------------
+    # SPECIFIC PLAN — BASIC
+    # --------------------------------------------------------
+
+    if (
+        "basic" in text
+        and any(
+            word in text
+            for word in [
+                "mein kya",
+                "me kya",
+                "kya milega",
+                "features",
+                "feature",
+                "details",
+                "batao",
+            ]
+        )
+    ):
+
+        return (
+            "Basic plan ₹2,000/month ka hai. "
+            "Isme aapko any 1 AI Agent + WhatsApp integration milti hai. 👍\n\n"
+            "Aap kis type ka business chalate hain?"
+        )
+
+    # --------------------------------------------------------
+    # SPECIFIC PLAN — BUSINESS
+    # --------------------------------------------------------
+
+    if (
+        "business" in text
+        and any(
+            word in text
+            for word in [
+                "plan",
+                "mein kya",
+                "me kya",
+                "kya milega",
+                "features",
+                "feature",
+                "details",
+                "batao",
+            ]
+        )
+    ):
+
+        return (
+            "Business plan ₹10,000/month ka hai. "
+            "Isme all 5 AI Agents, Custom Automation Workflows aur Priority Support milta hai. 👍\n\n"
+            "Aapka main automation requirement kya hai?"
+        )
+
+    # --------------------------------------------------------
+    # CUSTOMER ANSWERS BUSINESS TYPE
+    # --------------------------------------------------------
+
+    business_types = {
+        "real estate": "Real estate",
+        "property": "Real estate",
+        "property dealer": "Real estate",
+        "coaching": "coaching",
+        "coaching centre": "coaching",
+        "coaching center": "coaching",
+        "clinic": "clinic",
+        "hospital": "hospital",
+        "school": "school",
+        "restaurant": "restaurant",
+        "cafe": "restaurant",
+        "salon": "salon",
+        "ecommerce": "ecommerce",
+        "e-commerce": "ecommerce",
+        "online store": "ecommerce",
+        "agency": "agency",
+        "consulting": "consulting",
+    }
+
+    detected_business = None
+
+    for keyword, business in business_types.items():
+        if keyword in text:
+            detected_business = business
+            break
+
+    if detected_business:
+
+        if detected_business == "Real estate":
+            return (
+                "Real estate mein Sales Agent kaafi useful ho sakta hai — "
+                "lead capture, qualification aur WhatsApp follow-ups automate kar sakta hai. 👍\n\n"
+                "Aap roughly kitne leads handle karte hain?"
+            )
+
+        if detected_business == "coaching":
+            return (
+                "Coaching business mein Sales Agent enquiries, lead qualification "
+                "aur WhatsApp follow-ups automate kar sakta hai. 👍\n\n"
+                "Aapko roughly kitni enquiries/leads monthly aati hain?"
+            )
+
+        if detected_business in [
+            "clinic",
+            "hospital",
+        ]:
+            return (
+                f"{detected_business.title()} ke liye Support Agent aur Sales Agent "
+                "dono useful ho sakte hain — queries, follow-ups aur lead handling automate ho sakti hai. 👍\n\n"
+                "Aapko zyada problem customer queries mein hai ya leads mein?"
+            )
+
+        if detected_business in [
+            "school",
+            "restaurant",
+            "salon",
+            "ecommerce",
+            "agency",
+            "consulting",
+        ]:
+            return (
+                f"{detected_business.title()} business mein WhatsApp automation "
+                "aur Sales Agent repetitive customer handling ko automate kar sakte hain. 👍\n\n"
+                "Aapka main requirement leads hai ya customer support?"
+            )
+
+    # --------------------------------------------------------
+    # SHORT NUMERIC ANSWER
+    # --------------------------------------------------------
+
+    if re.fullmatch(
+        r"\d+(?:\.\d+)?",
+        text,
+    ):
+
+        if any(
+            word in last_assistant_message
+            for word in [
+                "lead",
+                "leads",
+                "enquiries",
+                "enquiry",
+                "customers",
+            ]
+        ):
+
+            return (
+                f"{user_message} leads/month ke volume par "
+                "Sales Agent useful ho sakta hai — especially qualification aur follow-ups automate karne ke liye. 👍\n\n"
+                "Kya aap abhi ye leads manually WhatsApp par handle karte hain?"
+            )
+
+    # --------------------------------------------------------
+    # YES / HAAN AFTER A QUESTION
+    # --------------------------------------------------------
+
+    if text in [
+        "haan",
+        "han",
+        "yes",
+        "yep",
+        "yeah",
+        "ji",
+        "ji haan",
+    ]:
+
+        if any(
+            word in last_assistant_message
+            for word in [
+                "manually",
+                "manual",
+                "whatsapp par handle",
+            ]
+        ):
+
+            return (
+                "Samajh gaya 👍 Manual handling mein kaafi repetitive work ho sakta hai. "
+                "Sales Agent incoming leads ko automatically qualify aur follow-up kar sakta hai.\n\n"
+                "Kya aap iska demo dekhna chahenge?"
+            )
+
+    # --------------------------------------------------------
+    # NO AFTER A QUESTION
+    # --------------------------------------------------------
+
+    if text in [
+        "nahi",
+        "nahin",
+        "no",
+        "nope",
+        "not really",
+    ]:
+
+        return (
+            "Samajh gaya 👍 Phir aapke current workflow ke hisaab se "
+            "automation ka best use-case identify kar sakte hain.\n\n"
+            "Aapki main problem kis cheez mein hai?"
+        )
+
+    # --------------------------------------------------------
+    # DEMO INTENT
+    # --------------------------------------------------------
+
+    demo_words = [
+        "demo",
+        "demo chahiye",
+        "demo lena",
+        "demo dekhna",
+        "demo dikhao",
+        "book demo",
+    ]
+
+    if any(
+        word in text
+        for word in demo_words
+    ):
+
+        demo_date, demo_time, demo_datetime = (
+            extract_demo_datetime(user_message)
+        )
+
+        if (
+            not demo_date
+            and not demo_time
+            and not demo_datetime
+        ):
+            return (
+                "Bilkul 👍 Demo ke liye aapko kaunsa "
+                "date aur time convenient rahega?"
+            )
+
+    # --------------------------------------------------------
+    # NOTHING DETERMINISTIC
+    # --------------------------------------------------------
+
+    return None
 
 
 # ============================================================
@@ -2399,8 +2731,21 @@ async def generate_agent_reply(
     # --------------------------------------------------------
 
     history = normalize_history(
-        history or []
+    history or []
+ )
+
+    # --------------------------------------------------------
+    # CONVERSATIONAL SALES ENGINE V3
+    # --------------------------------------------------------
+
+    direct_reply = conversational_sales_reply(
+    user_message=user_message,
+    history=history,
+    customer_memory=customer_memory,
     )
+
+    if direct_reply:
+      return direct_reply
 
     # --------------------------------------------------------
     # VALIDATE AGENT
