@@ -20,6 +20,7 @@ from app.models import Lead, Message
 from app.services.ai_agent import (
     detect_agent,
     extract_lead_info,
+    extract_demo_datetime,
     generate_agent_reply,
     is_potential_lead,
     normalize_history,
@@ -366,10 +367,6 @@ def process_customer_memory(
     )
 
     try:
-
-        from app.services.ai_agent import (
-            extract_demo_datetime,
-        )
 
         (
             demo_date,
