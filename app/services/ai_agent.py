@@ -2471,7 +2471,7 @@ async def generate_agent_reply(
 
                     temperature=0.35,
 
-                    max_tokens=500,
+                    max_tokens=1000,
                 )
             )
 
