@@ -2518,12 +2518,20 @@ def conversational_sales_reply(
                 "aur Sales Agent repetitive customer handling ko automate kar sakte hain. 👍\n\n"
                 "Aapka main requirement leads hai ya customer support?"
             )
-        # ========================================================
+                # ========================================================
     # GENERIC BUDGET CONTEXT
     # ========================================================
-    # Never assume that "budget" means Xytralyn pricing.
-    # The customer may be talking about property,
-    # marketing, expansion, equipment, investment, etc.
+    # Xytralyn clients can belong to ANY industry.
+    #
+    # Never assume that a budget amount is:
+    # - property budget
+    # - Xytralyn software budget
+    # - marketing budget
+    # - investment budget
+    # - expansion budget
+    #
+    # Understand the purpose from the current message.
+    # If the purpose is unclear, ask one clarification.
 
     budget_words = [
         "budget",
@@ -2538,58 +2546,79 @@ def conversational_sales_reply(
 
     if any(word in text for word in budget_words):
 
-        # Build broader conversation context
-        # so budget meaning can be understood from
-        # previous conversation + confirmed memory.
-
-        conversation_context = (
-            str(customer_memory or "")
-            + " "
-            + last_assistant_message
-            + " "
-            + " ".join(
-                item.get("content", "")
-                for item in history[-8:]
-                if isinstance(item, dict)
-            )
-        ).lower()
-
         # ----------------------------------------------------
-        # REAL ESTATE / PROPERTY CONTEXT
+        # EXPLICIT XYTRALYN / SOFTWARE CONTEXT
         # ----------------------------------------------------
 
-        real_estate_context = [
-            "real estate",
-            "property",
-            "property type",
-            "property budget",
-            "buying timeline",
-            "location",
-            "flat",
-            "apartment",
-            "plot",
-            "villa",
-            "house",
-            "commercial property",
+        xytralyn_context_words = [
+            "xytralyn",
+            "ai agent",
+            "ai agents",
+            "automation",
+            "software",
+            "saas",
+            "subscription",
+            "crm",
+            "plan",
+            "pricing",
         ]
 
         if any(
-            word in conversation_context
-            for word in real_estate_context
+            word in text
+            for word in xytralyn_context_words
         ):
             return (
                 f"Got it 👍 {user_message.strip()} noted. "
-                "Lead qualification mein budget ke saath "
-                "property type, location aur buying timeline "
-                "bhi useful rahenge.\n\n"
-                "Aap kis type ki property target karte hain?"
+                "Agar ye Xytralyn automation ke liye budget hai, "
+                "to main aapki requirement ke according suitable "
+                "plan suggest kar sakta hoon.\n\n"
+                "Aapko kitne AI agents ki requirement hai?"
             )
 
         # ----------------------------------------------------
-        # OTHER BUSINESS / UNKNOWN CONTEXT
+        # EXPLICIT PURPOSE IN CURRENT MESSAGE
         # ----------------------------------------------------
-        # Do NOT assume that the amount is an Xytralyn
-        # software budget or an Enterprise budget.
+        # Examples:
+        # "marketing ka budget 5 lakh hai"
+        # "expansion ka budget 20 lakh hai"
+        # "equipment ka budget 10 lakh hai"
+        # "investment budget 50 lakh hai"
+        #
+        # Do NOT convert these into Xytralyn pricing.
+
+        purpose_words = [
+            "marketing",
+            "advertising",
+            "ads",
+            "expansion",
+            "investment",
+            "equipment",
+            "setup",
+            "renovation",
+            "construction",
+            "inventory",
+            "staff",
+            "hiring",
+            "business expansion",
+            "business setup",
+        ]
+
+        if any(
+            word in text
+            for word in purpose_words
+        ):
+            return (
+                f"Got it 👍 {user_message.strip()} noted. "
+                "Samajh gaya, ye aapke business ke "
+                "budget se related hai.\n\n"
+                "Aap is budget ko kis specific requirement "
+                "ke liye use karna chahte hain?"
+            )
+
+        # ----------------------------------------------------
+        # UNKNOWN PURPOSE
+        # ----------------------------------------------------
+        # Never guess the industry or purpose.
 
         return (
             f"Got it 👍 {user_message.strip()} noted. "
