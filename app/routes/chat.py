@@ -54,6 +54,9 @@ META_GRAPH_VERSION = (
     os.getenv("META_GRAPH_VERSION") or "v26.0"
 ).strip()
 
+ADMIN_WHATSAPP_NUMBER = (
+    os.getenv("ADMIN_WHATSAPP_NUMBER") or ""
+).strip()
 
 # ============================================================
 # CUSTOMER MEMORY
@@ -667,8 +670,223 @@ async def send_whatsapp_message(
         )
 
         return False
+# ============================================================
+# ADMIN LEAD NOTIFICATION
+# ============================================================
 
+async def notify_admin_new_lead(
+    lead,
+    sender_phone: str,
+    lead_data: Optional[Dict[str, Any]] = None,
+) -> bool:
 
+    if not ADMIN_WHATSAPP_NUMBER:
+        logger.warning(
+            "ADMIN_WHATSAPP_NUMBER is not configured."
+        )
+        return False
+
+    lead_data = lead_data or {}
+
+    name = (
+        getattr(lead, "name", None)
+        or lead_data.get("name")
+        or "Not provided"
+    )
+
+    company = (
+        getattr(lead, "company", None)
+        or lead_data.get("company")
+        or "Not provided"
+    )
+
+    business_type = (
+        getattr(lead, "business_type", None)
+        or lead_data.get("business_type")
+        or "Not provided"
+    )
+
+    lead_volume = (
+        getattr(lead, "lead_volume", None)
+        or lead_data.get("lead_volume")
+        or "Not provided"
+    )
+
+    interested_agent = (
+        getattr(lead, "interested_agent", None)
+        or lead_data.get("interested_agent")
+        or "Not specified"
+    )
+
+    demo_date = (
+        getattr(lead, "demo_date", None)
+        or lead_data.get("demo_date")
+    )
+
+    demo_time = (
+        getattr(lead, "demo_time", None)
+        or lead_data.get("demo_time")
+    )
+
+    demo_datetime = (
+        getattr(lead, "demo_datetime", None)
+        or lead_data.get("demo_datetime")
+    )
+
+    demo_status = (
+        getattr(lead, "demo_status", None)
+        or "not_scheduled"
+    )
+
+    if demo_datetime:
+        demo_text = str(demo_datetime)
+
+    elif demo_date or demo_time:
+        demo_text = (
+            f"{demo_date or ''} "
+            f"{demo_time or ''}"
+        ).strip()
+
+    else:
+        demo_text = "Not scheduled"
+
+    message = f"""
+🚨 NEW LEAD CONFIRMED
+
+👤 Name: {name}
+📱 Phone: +{sender_phone}
+
+🏢 Business: {company}
+🏷️ Business Type: {business_type}
+
+🎯 Interested Agent: {interested_agent}
+📊 Lead Volume: {lead_volume}
+
+📅 Demo: {demo_text}
+📌 Demo Status: {demo_status}
+
+📍 Source: WhatsApp
+
+Please follow up with this lead.
+""".strip()
+
+    return await send_whatsapp_message(
+        recipient_phone=ADMIN_WHATSAPP_NUMBER,
+        message_text=message,
+    )
+# ============================================================
+# LEAD CONFIRMATION DETECTION
+# ============================================================
+
+def is_lead_confirmation_message(
+    user_message: str,
+    history: Optional[List[Dict[str, Any]]] = None,
+) -> bool:
+    """
+    Detect whether the customer is explicitly confirming
+    interest after a meaningful sales/demo conversation.
+    """
+
+    if not user_message:
+        return False
+
+    text = re.sub(
+        r"\s+",
+        " ",
+        user_message.strip().lower(),
+    )
+
+    confirmation_phrases = [
+        "haan demo",
+        "haan mujhe demo",
+        "yes demo",
+        "yes i want demo",
+        "interested hoon",
+        "i am interested",
+        "i'm interested",
+        "we are interested",
+        "interested",
+        "proceed karo",
+        "proceed karna hai",
+        "aage badho",
+        "let's proceed",
+        "lets proceed",
+        "i want to proceed",
+        "ready to proceed",
+        "go ahead",
+    ]
+
+    # Explicit confirmation phrase
+    if any(
+        phrase in text
+        for phrase in confirmation_phrases
+    ):
+        return True
+
+    # Short affirmative answers are confirmed only when
+    # the previous assistant message was clearly asking
+    # for demo/interest confirmation.
+    short_confirmations = {
+        "haan",
+        "han",
+        "ji",
+        "yes",
+        "yep",
+        "yeah",
+        "bilkul",
+        "sure",
+        "okay",
+        "ok",
+        "definitely",
+        "correct",
+    }
+
+    if text not in short_confirmations:
+        return False
+
+    if not history:
+        return False
+
+    # Look at the most recent assistant message.
+    for item in reversed(history):
+        if not isinstance(item, dict):
+            continue
+
+        role = str(
+            item.get("role")
+            or item.get("sender_type")
+            or ""
+        ).lower()
+
+        if role not in {
+            "assistant",
+            "ai",
+            "bot",
+        }:
+            continue
+
+        previous_reply = str(
+            item.get("content")
+            or item.get("message")
+            or ""
+        ).lower()
+
+        confirmation_context = [
+            "demo",
+            "interested",
+            "dekhna chahenge",
+            "dekhna chahte",
+            "proceed",
+            "aage badhna",
+            "continue",
+        ]
+
+        return any(
+            phrase in previous_reply
+            for phrase in confirmation_context
+        )
+
+    return False
 # ============================================================
 # META INCOMING MESSAGE PARSER
 # ============================================================
@@ -977,17 +1195,17 @@ async def handle_customer_message(
             sender_type="user",
         )
 
-        # ====================================================
+                # ====================================================
         # 6. UPDATE LEAD
         # ====================================================
 
-        if is_potential_lead(
-            user_message
-        ):
+        lead = None
+
+        if is_potential_lead(user_message):
 
             try:
 
-                update_or_create_lead(
+                lead = update_or_create_lead(
                     db=db,
                     sender_phone=sender_phone,
                     lead_data=lead_data,
@@ -999,6 +1217,86 @@ async def handle_customer_message(
                     "Lead update failed: %s",
                     exc,
                 )
+
+
+        # ====================================================
+        # 6A. LEAD CONFIRMATION
+        # ====================================================
+
+        confirmation_message = is_lead_confirmation_message(
+            user_message=user_message,
+            history=history,
+        )
+
+        if confirmation_message:
+
+            try:
+
+                # Existing lead fetch karo
+                if lead is None:
+
+                    lead = (
+                        db.query(Lead)
+                        .filter(
+                            Lead.phone == sender_phone
+                        )
+                        .first()
+                    )
+
+                # Agar lead exist nahi karti
+                if lead is None:
+
+                    lead = Lead(
+                        phone=sender_phone,
+                        status="new",
+                        demo_status="not_scheduled",
+                    )
+
+                    db.add(lead)
+                    db.commit()
+                    db.refresh(lead)
+
+                # Admin ko sirf ek baar notify karo
+                if getattr(
+                    lead,
+                    "status",
+                    None,
+                ) != "confirmed":
+
+                    admin_notified = (
+                        await notify_admin_new_lead(
+                            lead=lead,
+                            sender_phone=sender_phone,
+                            lead_data=lead_data,
+                        )
+                    )
+
+                    if admin_notified:
+
+                        lead.status = "confirmed"
+
+                        db.commit()
+                        db.refresh(lead)
+
+                        logger.info(
+                            "Lead confirmed and admin notified | phone=%s",
+                            sender_phone,
+                        )
+
+                    else:
+
+                        logger.warning(
+                            "Admin notification failed | phone=%s",
+                            sender_phone,
+                        )
+
+            except Exception as exc:
+
+                logger.exception(
+                    "Lead confirmation handling failed: %s",
+                    exc,
+                )
+
 
         # ====================================================
         # 7. AI REPLY
