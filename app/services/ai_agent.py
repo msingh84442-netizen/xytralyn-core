@@ -2518,7 +2518,86 @@ def conversational_sales_reply(
                 "aur Sales Agent repetitive customer handling ko automate kar sakte hain. 👍\n\n"
                 "Aapka main requirement leads hai ya customer support?"
             )
+        # ========================================================
+    # GENERIC BUDGET CONTEXT
+    # ========================================================
+    # Never assume that "budget" means Xytralyn pricing.
+    # The customer may be talking about property,
+    # marketing, expansion, equipment, investment, etc.
 
+    budget_words = [
+        "budget",
+        "budjet",
+        "budget hai",
+        "budget h",
+        "lakh budget",
+        "crore budget",
+        "lakh ka budget",
+        "crore ka budget",
+    ]
+
+    if any(word in text for word in budget_words):
+
+        # Build broader conversation context
+        # so budget meaning can be understood from
+        # previous conversation + confirmed memory.
+
+        conversation_context = (
+            str(customer_memory or "")
+            + " "
+            + last_assistant_message
+            + " "
+            + " ".join(
+                item.get("content", "")
+                for item in history[-8:]
+                if isinstance(item, dict)
+            )
+        ).lower()
+
+        # ----------------------------------------------------
+        # REAL ESTATE / PROPERTY CONTEXT
+        # ----------------------------------------------------
+
+        real_estate_context = [
+            "real estate",
+            "property",
+            "property type",
+            "property budget",
+            "buying timeline",
+            "location",
+            "flat",
+            "apartment",
+            "plot",
+            "villa",
+            "house",
+            "commercial property",
+        ]
+
+        if any(
+            word in conversation_context
+            for word in real_estate_context
+        ):
+            return (
+                f"Got it 👍 {user_message.strip()} noted. "
+                "Lead qualification mein budget ke saath "
+                "property type, location aur buying timeline "
+                "bhi useful rahenge.\n\n"
+                "Aap kis type ki property target karte hain?"
+            )
+
+        # ----------------------------------------------------
+        # OTHER BUSINESS / UNKNOWN CONTEXT
+        # ----------------------------------------------------
+        # Do NOT assume that the amount is an Xytralyn
+        # software budget or an Enterprise budget.
+
+        return (
+            f"Got it 👍 {user_message.strip()} noted. "
+            "Bas ek cheez clear karna chahunga — "
+            "ye budget kis purpose ke liye hai?"
+        )
+
+    
     # --------------------------------------------------------
     # SHORT NUMERIC ANSWER
     # --------------------------------------------------------
