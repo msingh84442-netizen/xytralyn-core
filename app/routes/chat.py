@@ -22,7 +22,6 @@ from app.services.ai_agent import (
     extract_lead_info,
     extract_demo_datetime,
     generate_agent_reply,
-    is_potential_lead,
     normalize_history,
     merge_customer_memory,
     memory_to_text,
@@ -58,6 +57,22 @@ ADMIN_WHATSAPP_NUMBER = (
     os.getenv("ADMIN_WHATSAPP_NUMBER") or ""
 ).strip()
 
+# ============================================================
+# GREEN-API ADMIN CONFIG
+# ============================================================
+
+GREEN_API_INSTANCE_ID = (
+    os.getenv("GREEN_API_INSTANCE_ID") or ""
+).strip()
+
+GREEN_API_TOKEN = (
+    os.getenv("GREEN_API_TOKEN") or ""
+).strip()
+
+GREEN_API_BASE_URL = (
+    os.getenv("GREEN_API_BASE_URL")
+    or "https://7107.api.greenapi.com"
+).strip().rstrip("/")
 # ============================================================
 # CUSTOMER MEMORY
 # ============================================================
@@ -671,6 +686,110 @@ async def send_whatsapp_message(
 
         return False
 # ============================================================
+# GREEN-API ADMIN MESSAGE SENDER
+# ============================================================
+
+async def send_admin_whatsapp_message(
+    message_text: str,
+) -> bool:
+
+    if not GREEN_API_INSTANCE_ID:
+        logger.error(
+            "GREEN_API_INSTANCE_ID is missing."
+        )
+        return False
+
+    if not GREEN_API_TOKEN:
+        logger.error(
+            "GREEN_API_TOKEN is missing."
+        )
+        return False
+
+    if not ADMIN_WHATSAPP_NUMBER:
+        logger.error(
+            "ADMIN_WHATSAPP_NUMBER is missing."
+        )
+        return False
+
+    if not message_text:
+        logger.error(
+            "Admin message is empty."
+        )
+        return False
+
+    admin_phone = normalize_customer_phone(
+        ADMIN_WHATSAPP_NUMBER
+    )
+
+    if not admin_phone:
+        logger.error(
+            "Invalid admin WhatsApp number."
+        )
+        return False
+
+    chat_id = f"{admin_phone}@c.us"
+
+    url = (
+        f"{GREEN_API_BASE_URL}/"
+        f"waInstance{GREEN_API_INSTANCE_ID}/"
+        f"sendMessage/{GREEN_API_TOKEN}"
+    )
+
+    payload = {
+        "chatId": chat_id,
+        "message": message_text,
+    }
+
+    headers = {
+        "Content-Type": "application/json"
+    }
+
+    try:
+
+        async with httpx.AsyncClient(
+            timeout=30.0
+        ) as client:
+
+            response = await client.post(
+                url,
+                headers=headers,
+                json=payload,
+            )
+
+        if response.is_success:
+
+            try:
+                data = response.json()
+            except Exception:
+                data = {}
+
+            logger.info(
+                "GREEN-API ADMIN MESSAGE SENT | "
+                "admin=%s | response=%s",
+                chat_id,
+                data,
+            )
+
+            return True
+
+        logger.error(
+            "GREEN-API ADMIN SEND FAILED | "
+            "status=%s | response=%s",
+            response.status_code,
+            response.text,
+        )
+
+        return False
+
+    except Exception as exc:
+
+        logger.exception(
+            "GREEN-API ADMIN SEND EXCEPTION: %s",
+            exc,
+        )
+
+        return False
+# ============================================================
 # ADMIN LEAD NOTIFICATION
 # ============================================================
 
@@ -733,160 +852,47 @@ async def notify_admin_new_lead(
         or lead_data.get("demo_datetime")
     )
 
-    demo_status = (
-        getattr(lead, "demo_status", None)
-        or "not_scheduled"
-    )
-
     if demo_datetime:
-        demo_text = str(demo_datetime)
+
+        demo_text = str(
+            demo_datetime
+        )
 
     elif demo_date or demo_time:
+
         demo_text = (
             f"{demo_date or ''} "
             f"{demo_time or ''}"
         ).strip()
 
     else:
+
         demo_text = "Not scheduled"
 
     message = f"""
-🚨 NEW LEAD CONFIRMED
+🚨 NEW DEMO LEAD
 
 👤 Name: {name}
-📱 Phone: +{sender_phone}
+📱 Customer Phone: +{sender_phone}
 
-🏢 Business: {company}
+🏢 Company: {company}
 🏷️ Business Type: {business_type}
 
 🎯 Interested Agent: {interested_agent}
 📊 Lead Volume: {lead_volume}
 
-📅 Demo: {demo_text}
-📌 Demo Status: {demo_status}
+📅 Preferred Demo: {demo_text}
 
-📍 Source: WhatsApp
+📌 Status: Preferred Slot
 
-Please follow up with this lead.
+⚠️ Customer has NOT been told that the demo is confirmed.
+
+👉 Please contact the customer and confirm availability.
 """.strip()
 
-    return await send_whatsapp_message(
-        recipient_phone=ADMIN_WHATSAPP_NUMBER,
-        message_text=message,
+    return await send_admin_whatsapp_message(
+        message_text=message
     )
-# ============================================================
-# LEAD CONFIRMATION DETECTION
-# ============================================================
-
-def is_lead_confirmation_message(
-    user_message: str,
-    history: Optional[List[Dict[str, Any]]] = None,
-) -> bool:
-    """
-    Detect whether the customer is explicitly confirming
-    interest after a meaningful sales/demo conversation.
-    """
-
-    if not user_message:
-        return False
-
-    text = re.sub(
-        r"\s+",
-        " ",
-        user_message.strip().lower(),
-    )
-
-    confirmation_phrases = [
-        "haan demo",
-        "haan mujhe demo",
-        "yes demo",
-        "yes i want demo",
-        "interested hoon",
-        "i am interested",
-        "i'm interested",
-        "we are interested",
-        "interested",
-        "proceed karo",
-        "proceed karna hai",
-        "aage badho",
-        "let's proceed",
-        "lets proceed",
-        "i want to proceed",
-        "ready to proceed",
-        "go ahead",
-    ]
-
-    # Explicit confirmation phrase
-    if any(
-        phrase in text
-        for phrase in confirmation_phrases
-    ):
-        return True
-
-    # Short affirmative answers are confirmed only when
-    # the previous assistant message was clearly asking
-    # for demo/interest confirmation.
-    short_confirmations = {
-        "haan",
-        "han",
-        "ji",
-        "yes",
-        "yep",
-        "yeah",
-        "bilkul",
-        "sure",
-        "okay",
-        "ok",
-        "definitely",
-        "correct",
-    }
-
-    if text not in short_confirmations:
-        return False
-
-    if not history:
-        return False
-
-    # Look at the most recent assistant message.
-    for item in reversed(history):
-        if not isinstance(item, dict):
-            continue
-
-        role = str(
-            item.get("role")
-            or item.get("sender_type")
-            or ""
-        ).lower()
-
-        if role not in {
-            "assistant",
-            "ai",
-            "bot",
-        }:
-            continue
-
-        previous_reply = str(
-            item.get("content")
-            or item.get("message")
-            or ""
-        ).lower()
-
-        confirmation_context = [
-            "demo",
-            "interested",
-            "dekhna chahenge",
-            "dekhna chahte",
-            "proceed",
-            "aage badhna",
-            "continue",
-        ]
-
-        return any(
-            phrase in previous_reply
-            for phrase in confirmation_context
-        )
-
-    return False
 # ============================================================
 # META INCOMING MESSAGE PARSER
 # ============================================================
@@ -1112,61 +1118,7 @@ async def handle_customer_message(
             customer_memory
         )
 
-        # ====================================================
-        # DEMO MEMORY SAFETY
-        # ====================================================
-        # If customer asks for a NEW demo but does not provide
-        # a date/time in the CURRENT message, do not expose an
-        # old demo slot to the AI for this turn.
-
-        (
-            current_demo_date,
-            current_demo_time,
-            current_demo_datetime,
-        ) = extract_demo_datetime(
-            user_message
-        )
-
-        clean_message = user_message.lower().strip()
-
-        is_demo_request = (
-            "demo" in clean_message
-            and any(
-                phrase in clean_message
-                for phrase in [
-                    "demo chahiye",
-                    "mujhe demo",
-                    "demo lena",
-                    "demo karna",
-                    "demo dekhna",
-                    "demo dikhao",
-                    "book demo",
-                    "demo book",
-                ]
-            )
-        )
-
-        if (
-            is_demo_request
-            and not current_demo_date
-            and not current_demo_time
-            and not current_demo_datetime
-        ):
-            customer_memory = {
-                key: value
-                for key, value in customer_memory.items()
-                if key not in {
-                    "demo_date",
-                    "demo_time",
-                    "demo_datetime",
-                    "demo_status",
-                }
-            }
-
-            customer_context = memory_to_text(
-                customer_memory
-            )
-
+        
         # ====================================================
         # 3. AGENT DETECTION
         # ====================================================
@@ -1196,19 +1148,56 @@ async def handle_customer_message(
         )
 
                 # ====================================================
-        # 6. UPDATE LEAD
+        # 6. UPDATE LEAD + DEMO-READY ADMIN NOTIFICATION
         # ====================================================
 
         lead = None
 
-        if is_potential_lead(user_message):
+        # process_customer_memory() has already persisted the latest
+        # customer information, including demo date/time.
+        # Use the complete persistent memory so older fields are not lost.
+        merged_lead_data = dict(customer_memory or {})
+        merged_lead_data.update(lead_data or {})
+
+        # Explicitly persist the extracted demo slot from this message.
+        try:
+
+            (
+                current_demo_date,
+                current_demo_time,
+                current_demo_datetime,
+            ) = extract_demo_datetime(user_message)
+
+            if current_demo_date:
+                merged_lead_data["demo_date"] = (
+                    current_demo_date
+                )
+
+            if current_demo_time:
+                merged_lead_data["demo_time"] = (
+                    current_demo_time
+                )
+
+            if current_demo_datetime:
+                merged_lead_data["demo_datetime"] = (
+                    current_demo_datetime
+                )
+
+        except Exception as exc:
+
+            logger.warning(
+                "Lead demo extraction failed: %s",
+                exc,
+            )
+
+        if merged_lead_data:
 
             try:
 
                 lead = update_or_create_lead(
                     db=db,
                     sender_phone=sender_phone,
-                    lead_data=lead_data,
+                    lead_data=merged_lead_data,
                 )
 
             except Exception as exc:
@@ -1218,68 +1207,86 @@ async def handle_customer_message(
                     exc,
                 )
 
+        # ----------------------------------------------------
+        # DEMO-READY CONDITION
+        # ----------------------------------------------------
+        # A preferred slot is enough to notify the admin.
+        # Name/company are included when available, but are not
+        # required for notification.
 
-        # ====================================================
-        # 6A. LEAD CONFIRMATION
-        # ====================================================
+        if lead is None:
 
-        confirmation_message = is_lead_confirmation_message(
-            user_message=user_message,
-            history=history,
-        )
+            lead = (
+                db.query(Lead)
+                .filter(
+                    Lead.phone == sender_phone
+                )
+                .first()
+            )
 
-        if confirmation_message:
+        if lead is not None:
 
-            try:
+            lead_demo_date = getattr(
+                lead,
+                "demo_date",
+                None,
+            )
 
-                # Existing lead fetch karo
-                if lead is None:
+            lead_demo_time = getattr(
+                lead,
+                "demo_time",
+                None,
+            )
 
-                    lead = (
-                        db.query(Lead)
-                        .filter(
-                            Lead.phone == sender_phone
-                        )
-                        .first()
-                    )
+            lead_demo_datetime = getattr(
+                lead,
+                "demo_datetime",
+                None,
+            )
 
-                # Agar lead exist nahi karti
-                if lead is None:
+            has_demo_slot = bool(
+                lead_demo_datetime
+                or (
+                    lead_demo_date
+                    and lead_demo_time
+                )
+            )
 
-                    lead = Lead(
-                        phone=sender_phone,
-                        status="new",
-                        demo_status="not_scheduled",
-                    )
-
-                    db.add(lead)
-                    db.commit()
-                    db.refresh(lead)
-
-                # Admin ko sirf ek baar notify karo
-                if getattr(
+            if (
+                has_demo_slot
+                and getattr(
                     lead,
                     "status",
                     None,
-                ) != "confirmed":
+                ) != "admin_notified"
+            ):
+
+                try:
 
                     admin_notified = (
                         await notify_admin_new_lead(
                             lead=lead,
                             sender_phone=sender_phone,
-                            lead_data=lead_data,
+                            lead_data=merged_lead_data,
                         )
                     )
 
                     if admin_notified:
 
-                        lead.status = "confirmed"
+                        # IMPORTANT:
+                        # admin_notified means the admin received
+                        # the lead. It does NOT mean the demo is
+                        # confirmed/booked.
+
+                        lead.status = (
+                            "admin_notified"
+                        )
 
                         db.commit()
                         db.refresh(lead)
 
                         logger.info(
-                            "Lead confirmed and admin notified | phone=%s",
+                            "Demo-ready lead sent to admin | phone=%s",
                             sender_phone,
                         )
 
@@ -1290,13 +1297,12 @@ async def handle_customer_message(
                             sender_phone,
                         )
 
-            except Exception as exc:
+                except Exception as exc:
 
-                logger.exception(
-                    "Lead confirmation handling failed: %s",
-                    exc,
-                )
-
+                    logger.exception(
+                        "Demo-ready admin notification failed: %s",
+                        exc,
+                    )
 
         # ====================================================
         # 7. AI REPLY
@@ -1578,7 +1584,11 @@ async def chat_health():
             META_ACCESS_TOKEN
             and META_PHONE_NUMBER_ID
         ),
-        "green_api": False,
+        "green_api": bool(
+            GREEN_API_INSTANCE_ID
+            and GREEN_API_TOKEN
+            and ADMIN_WHATSAPP_NUMBER
+        ),
         "twilio": False,
     }
 

@@ -2699,7 +2699,7 @@ def conversational_sales_reply(
             "automation ka best use-case identify kar sakte hain.\n\n"
             "Aapki main problem kis cheez mein hai?"
         )
-
+        # --------------------------------------------------------
     # --------------------------------------------------------
     # DEMO INTENT
     # --------------------------------------------------------
@@ -2722,11 +2722,45 @@ def conversational_sales_reply(
             extract_demo_datetime(user_message)
         )
 
+        # ----------------------------------------------------
+        # CHECK EXISTING DEMO SLOT IN CUSTOMER MEMORY
+        # ----------------------------------------------------
+
+        memory_has_demo_date = (
+            "Demo Date:" in customer_memory
+        )
+
+        memory_has_demo_time = (
+            "Demo Time:" in customer_memory
+        )
+
+        memory_has_demo_datetime = (
+            "Demo Date/Time:" in customer_memory
+        )
+
+        existing_demo_slot = (
+            memory_has_demo_date
+            or memory_has_demo_time
+            or memory_has_demo_datetime
+        )
+
+        # ----------------------------------------------------
+        # CURRENT MESSAGE HAS NO DATE/TIME
+        # ----------------------------------------------------
+
         if (
             not demo_date
             and not demo_time
             and not demo_datetime
         ):
+
+            if existing_demo_slot:
+                return (
+                    "Bilkul 👍 Aapka preferred demo slot "
+                    "already note hai. Team availability "
+                    "confirm karke aapse connect karegi."
+                )
+
             return (
                 "Bilkul 👍 Demo ke liye aapko kaunsa "
                 "date aur time convenient rahega?"
@@ -2790,49 +2824,11 @@ async def generate_agent_reply(
             "jaanna chahenge?"
         )
         # --------------------------------------------------------
-    # DEMO REQUEST WITHOUT DATE/TIME
+    # DEMO DATE/TIME HANDLING
     # --------------------------------------------------------
-    # If the customer asks for a demo but does NOT provide
-    # a date/time in the current message, do not reuse an old
-    # demo slot from memory or previous conversation.
-    
-    demo_date, demo_time, demo_datetime = extract_demo_datetime(
-        user_message
-    )
-
-    demo_request_words = [
-        "demo chahiye",
-        "demo lena hai",
-        "demo karna hai",
-        "demo dekhna hai",
-        "demo dikhao",
-        "demo dena hai",
-        "mujhe demo",
-        "demo please",
-        "book demo",
-        "demo book",
-    ]
-
-    clean_message = user_message.lower().strip()
-
-    is_demo_request = (
-        "demo" in clean_message
-        and any(
-            phrase in clean_message
-            for phrase in demo_request_words
-        )
-    )
-
-    if (
-        is_demo_request
-        and not demo_date
-        and not demo_time
-        and not demo_datetime
-    ):
-        return (
-            "Bilkul! 🚀 Aapke liye demo arrange kar sakte hain. "
-            "Aapko kaunsa date aur time convenient rahega?"
-        )
+    # Demo slot collection is handled by conversational_sales_reply().
+    # It receives the current confirmed customer memory, so an already
+    # saved demo slot is never requested again.
 
     # --------------------------------------------------------
     # NORMALIZE HISTORY
