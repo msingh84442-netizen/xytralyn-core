@@ -1,8 +1,9 @@
 import os
 import re
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, Dict, List, Any, Tuple
+from zoneinfo import ZoneInfo
 
 from groq import AsyncGroq
 from dotenv import load_dotenv
@@ -552,6 +553,50 @@ Never mention internal implementation.
 # ============================================================
 # GROQ CLIENT
 # ============================================================
+
+
+# ============================================================
+# CUSTOMER-AGNOSTIC EXTRACTION HELPERS
+# ============================================================
+
+XYTRALYN_TIMEZONE = os.getenv("XYTRALYN_TIMEZONE", "Asia/Kolkata").strip() or "Asia/Kolkata"
+
+def _xytralyn_now() -> datetime:
+    try:
+        return datetime.now(ZoneInfo(XYTRALYN_TIMEZONE))
+    except Exception:
+        return datetime.now()
+
+def _format_relative_date(kind: str) -> str:
+    now = _xytralyn_now().date()
+    target = now if kind == "today" else now + timedelta(days=1 if kind == "tomorrow" else 2)
+    return target.strftime("%d-%m-%Y")
+
+def _last_assistant_text(history: Optional[List[Dict[str, Any]]]) -> str:
+    for item in reversed(history or []):
+        if isinstance(item, dict) and str(item.get("role", "")).lower() == "assistant":
+            return str(item.get("content", "") or "").strip()
+    return ""
+
+def _demo_context_from_history(history: Optional[List[Dict[str, Any]]]) -> bool:
+    previous = _last_assistant_text(history).lower()
+    return bool(re.search(r"\b(?:demo|preferred slot|date and time|date/time|kaunsa date|kaunsa time|which date|which time)\b", previous))
+
+def extract_interested_agent(text: str) -> Optional[str]:
+    if not text:
+        return None
+    lower = text.lower()
+    patterns = {
+        "sales": ["sales agent", "sales automation", "sales ke liye", "sales chahiye", "sales mein"],
+        "support": ["support agent", "customer support", "support automation", "support chahiye"],
+        "hr": ["hr agent", "hr automation", "recruitment agent", "hiring agent", "hr chahiye"],
+        "accountant": ["accountant agent", "accounting agent", "accountant chahiye", "accounting automation"],
+        "research": ["research agent", "research automation", "research chahiye", "market research"],
+    }
+    for agent, phrases in patterns.items():
+        if any(phrase in lower for phrase in phrases):
+            return agent
+    return None
 
 def get_groq_client() -> Optional[AsyncGroq]:
     api_key = os.getenv("GROQ_API_KEY")
@@ -1132,6 +1177,9 @@ def extract_name(
         return None
 
     patterns = [
+        r"(?i)\bthis\s+is\s+([A-Za-z][A-Za-z .'-]{1,70}?)(?=[.!?,;]|$)",
+        r"(?i)\byou\s+can\s+call\s+me\s+([A-Za-z][A-Za-z .'-]{1,70}?)(?=[.!?,;]|$)",
+        r"(?i)\bmy\s+name\s+is\s+([A-Za-z][A-Za-z .'-]{1,70}?)(?=[.!?,;]|$)",
         r"(?i)\bmera\s+naam\s+"
         r"([A-Za-z][A-Za-z .'-]{1,60}?)"
         r"(?:\s+hai|\s+he\b|$)",
@@ -1181,6 +1229,9 @@ def extract_company(
         return None
 
     patterns = [
+        r"(?i)\bmy\s+firm\s+(?:is|name\s+is)\s+([^.!?,;]+)",
+        r"(?i)\b(?:company|firm)\s*[:\-]\s*([^.!?,;]+)",
+        r"(?i)\bmy\s+company\s+(?:is|name\s+is)\s+([^.!?,;]+)",
         r"(?i)\bmeri\s+company\s+"
         r"(?:ka|ki)\s+naam\s+"
         r"([A-Za-z0-9& .'-]{2,80})",
@@ -1229,6 +1280,22 @@ def detect_business_type(
         return None
 
     lower = text.lower()
+
+    generic_patterns = [
+        r"(?i)\b(?:i|we)\s+(?:run|own|operate|manage)\s+(?:a|an|the)\s+([^.!?,;]+?\b(?:company|business|firm|agency|clinic|hospital|school|institute|centre|center|studio|store|shop|startup|consultancy))",
+        r"(?i)\b(?:my|our|mera|hamara)\s+(?:business|industry|field|sector)\s+(?:is|hai|he)\s+([^.!?,;]+)",
+        r"(?i)\b(?:i|we)\s+(?:am|are)\s+in\s+(?:the\s+)?([^.!?,;]+?)\s+(?:business|industry|sector)\b",
+        r"(?i)\b(?:i|we)\s+work\s+in\s+([^.!?,;]+?)\s+(?:business|industry|sector)\b",
+    ]
+
+    for pattern in generic_patterns:
+        match = re.search(pattern, text)
+        if match:
+            value = re.sub(r"\s+", " ", match.group(1)).strip(" .,-")
+            value = re.sub(r"^(?:a|an|the)\s+", "", value, flags=re.I)
+            value = re.split(r"\s+(?:and|but|because|so|then)\s+", value, maxsplit=1, flags=re.I)[0]
+            if value and value.lower() not in {"automation", "ai", "software", "service", "services"}:
+                return value[:100]
 
     business_patterns = [
         (
@@ -1406,6 +1473,7 @@ def detect_business_type(
 
 def extract_lead_volume(
     text: str,
+    previous_assistant_message: str = "",
 ) -> Optional[int]:
 
     if not text:
@@ -1429,10 +1497,15 @@ def extract_lead_volume(
 
     if plain_number:
 
-        value = int(
-            plain_number.group(1)
-        )
+        # A bare number is only a lead volume when the previous assistant
+        # clearly asked about leads/customers/enquiries. Otherwise it may be
+        # a price, OTP, age, year, quantity, etc.
+        previous_assistant_message = locals().get("previous_assistant_message", "")
+        previous_lower = str(previous_assistant_message or "").lower()
+        if not re.search(r"\b(?:how many|kitne|kitni|roughly|approximately|monthly|per month|leads?|enquir(?:y|ies)|inquir(?:y|ies)|customers?|prospects?)\b", previous_lower):
+            return None
 
+        value = int(plain_number.group(1))
         if 1 <= value <= 1_000_000:
             return value
 
@@ -1776,6 +1849,15 @@ def extract_demo_datetime(
 
             demo_date = "tomorrow"
 
+    # Normalize relative dates immediately so persisted/admin data is
+    # unambiguous.
+    if demo_date == "today":
+        demo_date = _format_relative_date("today")
+    elif demo_date == "tomorrow":
+        demo_date = _format_relative_date("tomorrow")
+    elif demo_date == "day after tomorrow":
+        demo_date = _format_relative_date("day_after_tomorrow")
+
     # --------------------------------------------------------
     # DEMO DATE/TIME COMBINATION
     # --------------------------------------------------------
@@ -1811,6 +1893,7 @@ def extract_demo_datetime(
 
 def extract_lead_info(
     user_message: str,
+    history: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Optional[str]]:
 
     data: Dict[
@@ -1823,6 +1906,7 @@ def extract_lead_info(
         "company": None,
         "business_type": None,
         "lead_volume": None,
+        "interested_agent": None,
         "demo_date": None,
         "demo_time": None,
         "demo_datetime": None,
@@ -1857,7 +1941,10 @@ def extract_lead_info(
     )
 
     lead_volume = (
-        extract_lead_volume(text)
+        extract_lead_volume(
+            text,
+            previous_assistant_message=_last_assistant_text(history),
+        )
     )
 
     if lead_volume is not None:
@@ -1865,6 +1952,18 @@ def extract_lead_info(
         data["lead_volume"] = str(
             lead_volume
         )
+
+    data["interested_agent"] = extract_interested_agent(text)
+
+    # A date/time alone is a demo slot only when the current message or
+    # recent assistant message establishes demo context.
+    demo_signal = bool(re.search(
+        r"\b(?:demo|demo slot|book demo|demo chahiye|demo lena|demo dekhna)\b",
+        text.lower(),
+    )) or _demo_context_from_history(history)
+
+    if not demo_signal:
+        return data
 
     (
         demo_date,
@@ -1892,6 +1991,7 @@ MEMORY_FIELDS = [
     "company",
     "business_type",
     "lead_volume",
+    "interested_agent",
     "demo_date",
     "demo_time",
     "demo_datetime",

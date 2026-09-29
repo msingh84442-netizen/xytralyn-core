@@ -366,6 +366,7 @@ def build_chat_history(
 def process_customer_memory(
     sender_phone: str,
     user_message: str,
+    history: Optional[List[Dict[str, str]]] = None,
 ) -> Dict[str, Any]:
 
     sender_phone = normalize_customer_phone(
@@ -381,36 +382,9 @@ def process_customer_memory(
         )
 
     new_data = extract_lead_info(
-        user_message
+        user_message,
+        history=history or [],
     )
-
-    try:
-
-        (
-            demo_date,
-            demo_time,
-            demo_datetime,
-        ) = extract_demo_datetime(
-            user_message
-        )
-
-        if demo_date:
-            new_data["demo_date"] = demo_date
-
-        if demo_time:
-            new_data["demo_time"] = demo_time
-
-        if demo_datetime:
-            new_data["demo_datetime"] = (
-                demo_datetime
-            )
-
-    except Exception as exc:
-
-        logger.warning(
-            "Demo datetime extraction failed: %s",
-            exc,
-        )
 
     return update_customer_memory(
         sender_phone,
@@ -797,6 +771,7 @@ async def notify_admin_new_lead(
     lead,
     sender_phone: str,
     lead_data: Optional[Dict[str, Any]] = None,
+    notification_type: str = "NEW DEMO LEAD",
 ) -> bool:
 
     if not ADMIN_WHATSAPP_NUMBER:
@@ -869,8 +844,14 @@ async def notify_admin_new_lead(
 
         demo_text = "Not scheduled"
 
+    safe_notification_type = (
+        notification_type
+        if notification_type in {"NEW DEMO LEAD", "UPDATED DEMO LEAD"}
+        else "NEW DEMO LEAD"
+    )
+
     message = f"""
-🚨 NEW DEMO LEAD
+🚨 {safe_notification_type}
 
 👤 Name: {name}
 📱 Customer Phone: +{sender_phone}
@@ -1112,6 +1093,7 @@ async def handle_customer_message(
         customer_memory = process_customer_memory(
             sender_phone,
             user_message,
+            history=history,
         )
 
         customer_context = memory_to_text(
@@ -1132,7 +1114,8 @@ async def handle_customer_message(
         # ====================================================
 
         lead_data = extract_lead_info(
-            user_message
+            user_message,
+            history=history,
         )
 
         # ====================================================
@@ -1159,36 +1142,29 @@ async def handle_customer_message(
         merged_lead_data = dict(customer_memory or {})
         merged_lead_data.update(lead_data or {})
 
-        # Explicitly persist the extracted demo slot from this message.
-        try:
+        # Capture the persisted state before updating so we can notify the
+        # admin both for the first preferred demo slot and for later
+        # customer corrections/updates.
+        previous_lead = (
+            db.query(Lead)
+            .filter(Lead.phone == sender_phone)
+            .first()
+        )
 
-            (
-                current_demo_date,
-                current_demo_time,
-                current_demo_datetime,
-            ) = extract_demo_datetime(user_message)
-
-            if current_demo_date:
-                merged_lead_data["demo_date"] = (
-                    current_demo_date
-                )
-
-            if current_demo_time:
-                merged_lead_data["demo_time"] = (
-                    current_demo_time
-                )
-
-            if current_demo_datetime:
-                merged_lead_data["demo_datetime"] = (
-                    current_demo_datetime
-                )
-
-        except Exception as exc:
-
-            logger.warning(
-                "Lead demo extraction failed: %s",
-                exc,
-            )
+        previous_snapshot = {}
+        if previous_lead is not None:
+            for field in [
+                "name",
+                "email",
+                "company",
+                "business_type",
+                "lead_volume",
+                "interested_agent",
+                "demo_date",
+                "demo_time",
+                "demo_datetime",
+            ]:
+                previous_snapshot[field] = getattr(previous_lead, field, None)
 
         if merged_lead_data:
 
@@ -1252,23 +1228,67 @@ async def handle_customer_message(
                 )
             )
 
-            if (
+            current_snapshot = {
+                field: getattr(lead, field, None)
+                for field in [
+                    "name",
+                    "email",
+                    "company",
+                    "business_type",
+                    "lead_volume",
+                    "interested_agent",
+                    "demo_date",
+                    "demo_time",
+                    "demo_datetime",
+                ]
+            }
+
+            changed_fields = [
+                field
+                for field, value in current_snapshot.items()
+                if previous_snapshot.get(field) != value
+            ]
+
+            had_previous_demo = bool(
+                previous_snapshot.get("demo_datetime")
+                or (
+                    previous_snapshot.get("demo_date")
+                    and previous_snapshot.get("demo_time")
+                )
+            )
+
+            demo_changed = bool(
+                current_snapshot.get("demo_datetime") != previous_snapshot.get("demo_datetime")
+                or current_snapshot.get("demo_date") != previous_snapshot.get("demo_date")
+                or current_snapshot.get("demo_time") != previous_snapshot.get("demo_time")
+            )
+
+            # Notify on the first preferred slot. After that, notify again
+            # whenever the customer changes any meaningful lead/demo detail.
+            should_notify_admin = bool(
                 has_demo_slot
-                and getattr(
-                    lead,
-                    "status",
-                    None,
-                ) != "admin_notified"
-            ):
+                and (
+                    not had_previous_demo
+                    or bool(changed_fields)
+                    or demo_changed
+                )
+            )
+
+            if should_notify_admin:
 
                 try:
 
-                    admin_notified = (
-                        await notify_admin_new_lead(
-                            lead=lead,
-                            sender_phone=sender_phone,
-                            lead_data=merged_lead_data,
-                        )
+                    notification_type = (
+                        "UPDATED DEMO LEAD"
+                        if had_previous_demo
+                        else "NEW DEMO LEAD"
+                    )
+
+                    admin_notified = await notify_admin_new_lead(
+                        lead=lead,
+                        sender_phone=sender_phone,
+                        lead_data=merged_lead_data,
+                        notification_type=notification_type,
                     )
 
                     if admin_notified:
@@ -1278,15 +1298,14 @@ async def handle_customer_message(
                         # the lead. It does NOT mean the demo is
                         # confirmed/booked.
 
-                        lead.status = (
-                            "admin_notified"
-                        )
+                        lead.status = "admin_notified"
 
                         db.commit()
                         db.refresh(lead)
 
                         logger.info(
-                            "Demo-ready lead sent to admin | phone=%s",
+                            "Demo lead notification sent | type=%s | phone=%s",
+                            notification_type,
                             sender_phone,
                         )
 
