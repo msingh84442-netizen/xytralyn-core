@@ -424,9 +424,9 @@ def update_or_create_lead(
 
     lead_data = sanitize_customer_memory_data(lead_data or {})
 
-    if not lead_data:
-        return None
-
+    # The phone number itself identifies the customer. Therefore a Lead row
+    # must still exist even when this particular message contains no
+    # extractable field.
     lead = (
         db.query(Lead)
         .filter(Lead.phone == sender_phone)
@@ -492,6 +492,22 @@ def update_or_create_lead(
 
     db.commit()
     db.refresh(lead)
+
+    logger.info(
+        "XYTRALYN DB | lead upserted | phone=%s | lead_id=%s | "
+        "name=%s | company=%s | business_type=%s | lead_volume=%s | "
+        "interested_agent=%s | demo=%s %s",
+        sender_phone,
+        getattr(lead, "id", None),
+        getattr(lead, "name", None) or "Not provided",
+        getattr(lead, "company", None) or "Not provided",
+        getattr(lead, "business_type", None) or "Not provided",
+        getattr(lead, "lead_volume", None) or "Not provided",
+        getattr(lead, "interested_agent", None) or "Not specified",
+        getattr(lead, "demo_date", None) or "",
+        getattr(lead, "demo_time", None) or "",
+    )
+
     return lead
 
 
@@ -530,6 +546,14 @@ def save_message(
     db.add(message)
     db.commit()
     db.refresh(message)
+
+    logger.info(
+        "XYTRALYN DB | message saved | phone=%s | sender_type=%s | "
+        "message_id=%s",
+        sender_phone,
+        sender_type,
+        getattr(message, "id", None),
+    )
 
     return message
 
@@ -1062,11 +1086,9 @@ async def handle_customer_message(
     ).strip()
 
     if not sender_phone:
-
         logger.error(
             "Customer phone missing."
         )
-
         return None
 
     if not user_message:
@@ -1086,8 +1108,41 @@ async def handle_customer_message(
             HISTORY_LIMIT,
         )
 
-                # ====================================================
-        # 2. UPDATE CUSTOMER MEMORY
+        # ====================================================
+        # 2. SNAPSHOT LEAD BEFORE THIS TURN
+        # ====================================================
+        # This MUST happen before memory/update so that a first demo slot
+        # and a later demo correction can be detected correctly.
+
+        snapshot_fields = [
+            "name",
+            "email",
+            "company",
+            "business_type",
+            "lead_volume",
+            "interested_agent",
+            "demo_date",
+            "demo_time",
+            "demo_datetime",
+        ]
+
+        previous_lead = (
+            db.query(Lead)
+            .filter(Lead.phone == sender_phone)
+            .first()
+        )
+
+        previous_snapshot = {
+            field: (
+                getattr(previous_lead, field, None)
+                if previous_lead is not None
+                else None
+            )
+            for field in snapshot_fields
+        }
+
+        # ====================================================
+        # 3. UPDATE CUSTOMER MEMORY
         # ====================================================
 
         customer_memory = process_customer_memory(
@@ -1100,9 +1155,8 @@ async def handle_customer_message(
             customer_memory
         )
 
-        
         # ====================================================
-        # 3. AGENT DETECTION
+        # 4. AGENT DETECTION
         # ====================================================
 
         agent_name = detect_agent(
@@ -1110,7 +1164,7 @@ async def handle_customer_message(
         )
 
         # ====================================================
-        # 4. LEAD EXTRACTION
+        # 5. LEAD EXTRACTION
         # ====================================================
 
         lead_data = extract_lead_info(
@@ -1119,7 +1173,7 @@ async def handle_customer_message(
         )
 
         # ====================================================
-        # 5. SAVE USER MESSAGE
+        # 6. SAVE USER MESSAGE
         # ====================================================
 
         save_message(
@@ -1130,146 +1184,99 @@ async def handle_customer_message(
             sender_type="user",
         )
 
-                # ====================================================
-        # 6. UPDATE LEAD + DEMO-READY ADMIN NOTIFICATION
         # ====================================================
+        # 7. UPDATE LEAD
+        # ====================================================
+        # Merge persistent memory with the fields extracted from this turn.
+        # Do not insert hard-coded customer examples.
 
-        lead = None
-
-        # process_customer_memory() has already persisted the latest
-        # customer information, including demo date/time.
-        # Use the complete persistent memory so older fields are not lost.
-        merged_lead_data = dict(customer_memory or {})
-        merged_lead_data.update(lead_data or {})
-
-        # Capture the persisted state before updating so we can notify the
-        # admin both for the first preferred demo slot and for later
-        # customer corrections/updates.
-        previous_lead = (
-            db.query(Lead)
-            .filter(Lead.phone == sender_phone)
-            .first()
+        merged_lead_data = dict(
+            customer_memory or {}
         )
 
-        previous_snapshot = {}
-        if previous_lead is not None:
-            for field in [
-                "name",
-                "email",
-                "company",
-                "business_type",
-                "lead_volume",
-                "interested_agent",
-                "demo_date",
-                "demo_time",
-                "demo_datetime",
-            ]:
-                previous_snapshot[field] = getattr(previous_lead, field, None)
+        for field, value in (lead_data or {}).items():
+            if is_valid_memory_value(value):
+                if (
+                    field != "name"
+                    or is_valid_customer_name(value)
+                ):
+                    merged_lead_data[field] = value
 
-        if merged_lead_data:
+        logger.info(
+            "XYTRALYN LEAD | extracted | phone=%s | data=%s",
+            sender_phone,
+            merged_lead_data,
+        )
 
-            try:
+        try:
 
-                lead = update_or_create_lead(
-                    db=db,
-                    sender_phone=sender_phone,
-                    lead_data=merged_lead_data,
-                )
+            # Always upsert by phone, even if merged_lead_data is empty.
+            # This guarantees that every WhatsApp customer has a Lead row.
+            lead = update_or_create_lead(
+                db=db,
+                sender_phone=sender_phone,
+                lead_data=merged_lead_data,
+            )
 
-            except Exception as exc:
+        except Exception as exc:
 
-                logger.exception(
-                    "Lead update failed: %s",
-                    exc,
-                )
-
-        # ----------------------------------------------------
-        # DEMO-READY CONDITION
-        # ----------------------------------------------------
-        # A preferred slot is enough to notify the admin.
-        # Name/company are included when available, but are not
-        # required for notification.
-
-        if lead is None:
+            logger.exception(
+                "Lead update failed | phone=%s | data=%s | error=%s",
+                sender_phone,
+                merged_lead_data,
+                exc,
+            )
 
             lead = (
                 db.query(Lead)
-                .filter(
-                    Lead.phone == sender_phone
-                )
+                .filter(Lead.phone == sender_phone)
                 .first()
             )
 
+        # ====================================================
+        # 8. DEMO-READY ADMIN NOTIFICATION
+        # ====================================================
+        # NEW  -> first preferred demo slot.
+        # UPDATED -> demo date/time changed after a previous slot.
+        # Ordinary lead-field changes without a demo change do NOT
+        # generate repeated demo notifications.
+
         if lead is not None:
 
-            lead_demo_date = getattr(
-                lead,
-                "demo_date",
-                None,
-            )
-
-            lead_demo_time = getattr(
-                lead,
-                "demo_time",
-                None,
-            )
-
-            lead_demo_datetime = getattr(
-                lead,
-                "demo_datetime",
-                None,
-            )
-
-            has_demo_slot = bool(
-                lead_demo_datetime
-                or (
-                    lead_demo_date
-                    and lead_demo_time
-                )
-            )
-
             current_snapshot = {
-                field: getattr(lead, field, None)
-                for field in [
-                    "name",
-                    "email",
-                    "company",
-                    "business_type",
-                    "lead_volume",
-                    "interested_agent",
-                    "demo_date",
-                    "demo_time",
-                    "demo_datetime",
-                ]
+                field: getattr(
+                    lead,
+                    field,
+                    None,
+                )
+                for field in snapshot_fields
             }
 
-            changed_fields = [
-                field
-                for field, value in current_snapshot.items()
-                if previous_snapshot.get(field) != value
-            ]
+            has_demo_slot = bool(
+                current_snapshot.get("demo_datetime")
+                or current_snapshot.get("demo_date")
+                or current_snapshot.get("demo_time")
+            )
 
             had_previous_demo = bool(
                 previous_snapshot.get("demo_datetime")
-                or (
-                    previous_snapshot.get("demo_date")
-                    and previous_snapshot.get("demo_time")
-                )
+                or previous_snapshot.get("demo_date")
+                or previous_snapshot.get("demo_time")
             )
 
             demo_changed = bool(
-                current_snapshot.get("demo_datetime") != previous_snapshot.get("demo_datetime")
-                or current_snapshot.get("demo_date") != previous_snapshot.get("demo_date")
-                or current_snapshot.get("demo_time") != previous_snapshot.get("demo_time")
+                current_snapshot.get("demo_datetime")
+                != previous_snapshot.get("demo_datetime")
+                or current_snapshot.get("demo_date")
+                != previous_snapshot.get("demo_date")
+                or current_snapshot.get("demo_time")
+                != previous_snapshot.get("demo_time")
             )
 
-            # Notify on the first preferred slot. After that, notify again
-            # whenever the customer changes any meaningful lead/demo detail.
             should_notify_admin = bool(
                 has_demo_slot
                 and (
                     not had_previous_demo
-                    or bool(changed_fields)
                     or demo_changed
                 )
             )
@@ -1293,18 +1300,15 @@ async def handle_customer_message(
 
                     if admin_notified:
 
-                        # IMPORTANT:
-                        # admin_notified means the admin received
-                        # the lead. It does NOT mean the demo is
-                        # confirmed/booked.
-
+                        # Admin receipt is NOT demo confirmation.
                         lead.status = "admin_notified"
 
                         db.commit()
                         db.refresh(lead)
 
                         logger.info(
-                            "Demo lead notification sent | type=%s | phone=%s",
+                            "Demo lead notification sent | "
+                            "type=%s | phone=%s",
                             notification_type,
                             sender_phone,
                         )
@@ -1319,12 +1323,14 @@ async def handle_customer_message(
                 except Exception as exc:
 
                     logger.exception(
-                        "Demo-ready admin notification failed: %s",
+                        "Demo-ready admin notification failed | "
+                        "phone=%s | error=%s",
+                        sender_phone,
                         exc,
                     )
 
         # ====================================================
-        # 7. AI REPLY
+        # 9. AI REPLY
         # ====================================================
 
         logger.info(
@@ -1343,7 +1349,8 @@ async def handle_customer_message(
         if not reply:
 
             logger.error(
-                "AI returned empty reply."
+                "AI returned empty reply | phone=%s",
+                sender_phone,
             )
 
             return None
@@ -1354,7 +1361,7 @@ async def handle_customer_message(
             return None
 
         # ====================================================
-        # 8. SAVE ASSISTANT MESSAGE
+        # 10. SAVE ASSISTANT MESSAGE
         # ====================================================
 
         save_message(
@@ -1374,8 +1381,12 @@ async def handle_customer_message(
 
     except Exception as exc:
 
+        db.rollback()
+
         logger.exception(
-            "Customer message processing failed: %s",
+            "Customer message processing failed | "
+            "phone=%s | error=%s",
+            sender_phone,
             exc,
         )
 

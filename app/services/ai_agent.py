@@ -1,4 +1,4 @@
-import os
+
 import re
 import logging
 from datetime import datetime, timedelta
@@ -583,8 +583,35 @@ def _demo_context_from_history(history: Optional[List[Dict[str, Any]]]) -> bool:
     return bool(re.search(r"\b(?:demo|preferred slot|date and time|date/time|kaunsa date|kaunsa time|which date|which time)\b", previous))
 
 def extract_interested_agent(text: str) -> Optional[str]:
+    """Extract the customer's requested AI agent/service without hard-coded customer data."""
     if not text:
         return None
+    clean = " ".join(str(text).strip().split())
+    lower = clean.lower()
+    canonical_patterns = [
+        ("Sales", r"\bsales(?:\s+agent)?\b"),
+        ("Support", r"\bsupport(?:\s+agent)?\b"),
+        ("HR", r"\b(?:hr|human\s+resources)(?:\s+agent)?\b"),
+        ("Accountant", r"\b(?:accountant|accounting)(?:\s+agent)?\b"),
+        ("Research", r"\bresearch(?:\s+agent)?\b"),
+    ]
+    explicit_intent = re.search(r"\b(?:interested\s+in|want|need|chahiye|chahta(?:\s+hoon)?|chahti(?:\s+hoon)?|mujhe|we\s+need|i\s+need|i\s+want)\b", lower)
+    for canonical, pattern in canonical_patterns:
+        if re.search(pattern, lower) and (explicit_intent or re.search(pattern + r".{0,35}\b(?:chahiye|need|want|liye|lena|automation)\b", lower)):
+            return canonical
+    generic_patterns = [
+        r"\b(?:mujhe|we|i)\s+(?:an?\s+)?(.{2,80}?)\s+(?:ai\s+)?agent\s+(?:chahiye|need|want|lena|please)\b",
+        r"\b(.{2,80}?)\s+(?:ai\s+)?agent\s+(?:chahiye|need|want|lena)\b",
+        r"\b(?:interested\s+in|want|need)\s+(.{2,80}?)\s+(?:ai\s+)?agent\b",
+    ]
+    for pattern in generic_patterns:
+        match=re.search(pattern,clean,flags=re.I)
+        if match:
+            value=re.sub(r"\s+"," ",match.group(1)).strip(" .,-:;")
+            value=re.sub(r"^(?:an?|the)\s+","",value,flags=re.I).strip()
+            if 2 <= len(value) <= 80:
+                return value
+    return None
     lower = text.lower()
     patterns = {
         "sales": ["sales agent", "sales automation", "sales ke liye", "sales chahiye", "sales mein"],
@@ -1262,6 +1289,13 @@ def extract_company(
                 .strip(" .,-")
             )
 
+            value = re.sub(
+                r"\s+(?:hai|he|is)$",
+                "",
+                value,
+                flags=re.IGNORECASE,
+            ).strip(" .,-")
+
             if value:
                 return value[:100]
 
@@ -1286,6 +1320,8 @@ def detect_business_type(
         r"(?i)\b(?:my|our|mera|hamara)\s+(?:business|industry|field|sector)\s+(?:is|hai|he)\s+([^.!?,;]+)",
         r"(?i)\b(?:i|we)\s+(?:am|are)\s+in\s+(?:the\s+)?([^.!?,;]+?)\s+(?:business|industry|sector)\b",
         r"(?i)\b(?:i|we)\s+work\s+in\s+([^.!?,;]+?)\s+(?:business|industry|sector)\b",
+        r"(?i)\b(?:hum|ham|main|mai|i|we)\s+([^.!?,;]+?)\s+ka\s+business\s+(?:karte|chalate|chalaate|karta|hai|he|is)\b",
+        r"(?i)\b(?:mera|hamara|my|our)\s+([^.!?,;]+?)\s+business\s+(?:hai|he|is)\b",
     ]
 
     for pattern in generic_patterns:
@@ -1940,10 +1976,18 @@ def extract_lead_info(
         detect_business_type(text)
     )
 
+    recent_assistant_context = " ".join(
+        str(item.get("content", ""))
+        for item in (history or [])[-8:]
+        if isinstance(item, dict)
+        and item.get("role") == "assistant"
+        and item.get("content")
+    )
+
     lead_volume = (
         extract_lead_volume(
             text,
-            previous_assistant_message=_last_assistant_text(history),
+            previous_assistant_message=recent_assistant_context,
         )
     )
 
@@ -1955,15 +1999,19 @@ def extract_lead_info(
 
     data["interested_agent"] = extract_interested_agent(text)
 
-    # A date/time alone is a demo slot only when the current message or
-    # recent assistant message establishes demo context.
+    # Date/time is a demo slot only when demo context exists in the
+    # current message or recent assistant conversation.
     demo_signal = bool(re.search(
-        r"\b(?:demo|demo slot|book demo|demo chahiye|demo lena|demo dekhna)\b",
+        r"\b(?:demo|demo\s+slot|book\s+demo|demo\s+chahiye|demo\s+lena|demo\s+dekhna|preferred\s+slot)\b",
         text.lower(),
     )) or _demo_context_from_history(history)
-
     if not demo_signal:
         return data
+    demo_date, demo_time, demo_datetime = extract_demo_datetime(text)
+    data["demo_date"] = demo_date
+    data["demo_time"] = demo_time
+    data["demo_datetime"] = demo_datetime
+    return data
 
     (
         demo_date,
@@ -2856,15 +2904,176 @@ def conversational_sales_reply(
 
             if existing_demo_slot:
                 return (
-                    "Bilkul 👍 Aapka preferred demo slot "
-                    "already note hai. Team availability "
-                    "confirm karke aapse connect karegi."
+                    "Bilkul 👍 Aapka preferred demo slot already note hai. "
+                    "Agar isi slot par demo chahiye to team availability confirm karegi. "
+                    "Date/time change karna ho to naya slot bata dijiye."
                 )
 
             return (
                 "Bilkul 👍 Demo ke liye aapko kaunsa "
                 "date aur time convenient rahega?"
             )
+
+    # --------------------------------------------------------
+    # DEMO DATE/TIME ANSWER FROM CONVERSATION CONTEXT
+    # --------------------------------------------------------
+    # A customer often replies with only:
+    #   "kal 5 baje"
+    #   "1 October 6 baje"
+    #   "7 PM"
+    # after the assistant asked for a demo slot.
+    # These must be interpreted from conversation context rather than
+    # sent to the LLM as an unrelated message.
+
+    if _demo_context_from_history(history):
+
+        contextual_demo_date, contextual_demo_time, contextual_demo_datetime = (
+            extract_demo_datetime(user_message)
+        )
+
+        if (
+            contextual_demo_date
+            or contextual_demo_time
+            or contextual_demo_datetime
+        ):
+            slot_parts = []
+
+            if contextual_demo_date:
+                slot_parts.append(
+                    f"date {contextual_demo_date}"
+                )
+
+            if contextual_demo_time:
+                slot_parts.append(
+                    f"time {contextual_demo_time}"
+                )
+
+            slot_text = " aur ".join(slot_parts)
+
+            return (
+                f"Bilkul 👍 {slot_text} ka preferred demo slot note kar liya hai. "
+                "Team availability confirm karegi.\n\n"
+                "Aap demo mein kis workflow ko dekhna chahenge?"
+            )
+
+    # --------------------------------------------------------
+    # CUSTOMER INFORMATION ACKNOWLEDGEMENT
+    # --------------------------------------------------------
+    # Keep lead qualification generic. Do not rely on a closed list of
+    # industries or hard-coded customer names. When a customer gives a
+    # field directly, acknowledge it and ask only the next useful missing
+    # field instead of generating a long brochure-style response.
+
+    current_name = extract_name(user_message)
+    current_company = extract_company(user_message)
+    current_business_type = detect_business_type(user_message)
+    current_email = extract_email(user_message)
+    current_phone = extract_phone(user_message)
+    current_agent = extract_interested_agent(user_message)
+    current_volume = extract_lead_volume(
+        user_message,
+        previous_assistant_message=last_assistant_message,
+    )
+
+    current_fields = any([
+        current_name,
+        current_company,
+        current_business_type,
+        current_email,
+        current_phone,
+        current_agent,
+        current_volume is not None,
+    ])
+
+    if current_fields:
+
+        acknowledgements = []
+
+        if current_name:
+            acknowledgements.append(
+                f"Name: {current_name}"
+            )
+
+        if current_company:
+            acknowledgements.append(
+                f"Company: {current_company}"
+            )
+
+        if current_business_type:
+            acknowledgements.append(
+                f"Business: {current_business_type}"
+            )
+
+        if current_email:
+            acknowledgements.append(
+                f"Email: {current_email}"
+            )
+
+        if current_phone:
+            acknowledgements.append(
+                "Phone number noted"
+            )
+
+        if current_agent:
+            acknowledgements.append(
+                f"Interested Agent: {current_agent.title()} Agent"
+            )
+
+        if current_volume is not None:
+            acknowledgements.append(
+                f"Lead volume: {current_volume}/month"
+            )
+
+        acknowledgement_text = ", ".join(acknowledgements)
+
+        # Merge current information with already confirmed memory so the
+        # next question is based on the actual missing field.
+        memory_lower = (customer_memory or "").lower()
+
+        has_business = bool(
+            current_business_type
+            or current_business_type
+            or re.search(
+                r"business type|business:|industry:",
+                memory_lower,
+            )
+        )
+
+        has_volume = bool(
+            current_volume is not None
+            or re.search(
+                r"lead volume:\s*[^\n]+",
+                memory_lower,
+            )
+        )
+
+        has_agent = bool(
+            current_agent
+            or re.search(
+                r"interested agent:\s*(?!not specified)[^\n]+",
+                memory_lower,
+            )
+        )
+
+        if not has_business:
+            next_question = "Aapka business kis type ka hai?"
+        elif not has_volume:
+            next_question = (
+                "Aap roughly kitne leads ya enquiries monthly handle karte hain?"
+            )
+        elif not has_agent:
+            next_question = (
+                "Aapko Sales, Support, HR, Accountant ya Research mein se kis agent ki need hai?"
+            )
+        else:
+            next_question = (
+                "Aap demo dekhna chahenge ya pehle pricing discuss karein?"
+            )
+
+        return (
+            f"Got it 👍 {acknowledgement_text}.\n\n"
+            f"{next_question}"
+        )
 
     # --------------------------------------------------------
     # NOTHING DETERMINISTIC
