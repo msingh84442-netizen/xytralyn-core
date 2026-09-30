@@ -934,20 +934,57 @@ def detect_agent(
     ).lower().strip()
 
     support_keywords = [
-        "technical issue",
-        "technical problem",
-        "login problem",
-        "login issue",
-        "not working",
-        "error aa raha",
-        "error hai",
-        "problem aa rahi",
-        "refund chahiye",
-        "complaint",
-        "bug",
-        "support chahiye",
-        "help chahiye",
-    ]
+    "technical issue",
+    "technical problem",
+
+    # Login / account problems
+    "login problem",
+    "login issue",
+    "login nhi ho raha",
+    "login nahi ho raha",
+    "login nahin ho raha",
+    "login ni ho raha",
+    "login nhi ho rha",
+    "login nahi ho rha",
+    "login nahin ho rha",
+    "log in nahi ho raha",
+    "log in nhi ho raha",
+    "sign in nahi ho raha",
+    "signin nahi ho raha",
+    "account login",
+    "account access",
+
+    # General technical problems
+    "not working",
+    "work nahi kar raha",
+    "kaam nahi kar raha",
+    "kaam nhi kar raha",
+    "error aa raha",
+    "error aa rha",
+    "error hai",
+    "problem aa rahi",
+    "problem aa rha",
+    "problem ho rahi",
+    "problem ho raha",
+    "issue aa raha",
+    "issue aa rahi",
+
+    # Help / support
+    "support chahiye",
+    "support karo",
+    "support please",
+    "help chahiye",
+    "please help",
+    "help me",
+    "meri help karo",
+    "madad chahiye",
+
+    # Complaints
+    "refund chahiye",
+    "complaint",
+    "complain",
+    "bug",
+]
 
     hr_keywords = [
         "job application",
