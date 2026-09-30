@@ -1,4 +1,4 @@
-# ============================================================
+
 # XYTRALYN CHAT ROUTE
 # META WHATSAPP CLOUD API
 # PART 1/2
@@ -7,6 +7,7 @@
 import os
 import re
 import logging
+import asyncio
 from typing import Optional, Dict, Any, List
 
 import httpx
@@ -16,6 +17,14 @@ from fastapi.responses import PlainTextResponse
 
 from app.database import SessionLocal
 from app.models import Lead, Message
+
+from app.services.support_agent import (
+    generate_support_reply,
+)
+
+from app.services.ticket_service import (
+    create_ticket,
+)
 
 from app.services.ai_agent import (
     detect_agent,
@@ -899,6 +908,118 @@ async def notify_admin_new_lead(
         message_text=message
     )
 # ============================================================
+# ADMIN SUPPORT TICKET NOTIFICATION
+# ============================================================
+
+async def notify_admin_new_support_ticket(
+    ticket: Dict[str, Any],
+    customer_name: Optional[str],
+) -> bool:
+    """
+    Notify the admin only after a NEW support ticket has been
+    successfully persisted.
+
+    Existing/duplicate tickets are intentionally not notified again.
+    """
+
+    if not isinstance(ticket, dict):
+        logger.error(
+            "Support ticket admin notification skipped | invalid ticket data."
+        )
+        return False
+
+    ticket_number = str(
+        ticket.get("ticket_number") or ""
+    ).strip()
+
+    if not ticket_number:
+        logger.error(
+            "Support ticket admin notification skipped | ticket number missing."
+        )
+        return False
+
+    name = str(
+        customer_name or "Not provided"
+    ).strip() or "Not provided"
+
+    phone = str(
+        ticket.get("customer_phone") or "Not provided"
+    ).strip()
+
+    category = str(
+        ticket.get("category") or "general"
+    ).strip()
+
+    priority = str(
+        ticket.get("priority") or "medium"
+    ).strip()
+
+    status = str(
+        ticket.get("status") or "open"
+    ).strip()
+
+    subject = str(
+        ticket.get("subject") or "Xytralyn Support Request"
+    ).strip()
+
+    description = str(
+        ticket.get("description") or "Not provided"
+    ).strip()
+
+    message = f"""
+🚨 NEW SUPPORT TICKET
+
+🎫 Ticket: #{ticket_number}
+
+👤 Customer: {name}
+📱 Phone: +{phone}
+
+📂 Category: {category.title()}
+🔥 Priority: {priority.upper()}
+📌 Status: {status.replace("_", " ").title()}
+
+📝 Subject:
+{subject}
+
+💬 Description:
+{description}
+
+👉 Please review the ticket and contact the customer if required.
+""".strip()
+
+    try:
+        sent = await send_admin_whatsapp_message(
+            message_text=message
+        )
+
+        if sent:
+            logger.info(
+                "Support ticket admin notification sent | "
+                "ticket=%s | phone=%s",
+                ticket_number,
+                phone,
+            )
+        else:
+            logger.warning(
+                "Support ticket admin notification failed | "
+                "ticket=%s | phone=%s",
+                ticket_number,
+                phone,
+            )
+
+        return sent
+
+    except Exception as exc:
+        logger.exception(
+            "Support ticket admin notification exception | "
+            "ticket=%s | error=%s",
+            ticket_number,
+            exc,
+        )
+        return False
+
+
+# ============================================================
 # META INCOMING MESSAGE PARSER
 # ============================================================
 
@@ -1332,33 +1453,215 @@ async def handle_customer_message(
         # ====================================================
         # 9. AI REPLY
         # ====================================================
+        #
+        # SUPPORT gets its own dedicated service.
+        # Other agents keep the existing production path.
+        # ====================================================
 
         logger.info(
-            "AI processing started | phone=%s",
+            "AI processing started | phone=%s | agent=%s",
             sender_phone,
+            agent_name,
         )
 
-        reply = await generate_agent_reply(
-            user_message=user_message,
-            history=history,
-            customer_memory=customer_context,
-            agent_name=agent_name,
-            business_name=BUSINESS_NAME,
-        )
+        ticket_result = None
 
-        if not reply:
+        if agent_name == "support":
 
-            logger.error(
-                "AI returned empty reply | phone=%s",
-                sender_phone,
+            # support_agent.py currently uses the synchronous Groq client.
+            # Run it in a worker thread so the async webhook is not blocked.
+            support_result = await asyncio.to_thread(
+                generate_support_reply,
+                user_message,
+                history,
+                customer_memory.get("name"),
             )
 
-            return None
+            if not isinstance(support_result, dict):
+                logger.error(
+                    "Support agent returned invalid result | phone=%s",
+                    sender_phone,
+                )
+                return None
 
-        reply = str(reply).strip()
+            reply = str(
+                support_result.get("reply") or ""
+            ).strip()
 
-        if not reply:
-            return None
+            # ------------------------------------------------
+            # SUPPORT TICKET CREATION
+            # ------------------------------------------------
+
+            if support_result.get("create_ticket"):
+
+                try:
+
+                    ticket_result = create_ticket(
+                        db=db,
+                        customer_phone=sender_phone,
+                        subject=support_result.get(
+                            "subject"
+                        ) or "Xytralyn Support Request",
+                        description=support_result.get(
+                            "description"
+                        ) or user_message,
+                        category=support_result.get(
+                            "category"
+                        ) or "general",
+                        priority=support_result.get(
+                            "priority"
+                        ) or "medium",
+                        user_id=getattr(
+                            lead,
+                            "user_id",
+                            None,
+                        ),
+                        prevent_duplicate=True,
+                    )
+
+                except Exception as exc:
+
+                    logger.exception(
+                        "Support ticket creation failed | "
+                        "phone=%s | error=%s",
+                        sender_phone,
+                        exc,
+                    )
+
+                    ticket_result = {
+                        "success": False,
+                        "created": False,
+                        "duplicate": False,
+                        "ticket": None,
+                        "error": str(exc),
+                    }
+
+                # Never claim a ticket exists unless the DB operation
+                # actually succeeded.
+                if (
+                    isinstance(ticket_result, dict)
+                    and ticket_result.get("success")
+                    and ticket_result.get("ticket")
+                ):
+
+                    ticket = ticket_result["ticket"]
+                    ticket_number = (
+                        ticket.get("ticket_number")
+                        or "N/A"
+                    )
+
+                    if ticket_result.get("created"):
+
+                        ticket_confirmation = (
+                            f"Support ticket #{ticket_number} "
+                            "create ho gaya hai. Support team "
+                            "aapki request check karegi."
+                        )
+
+                    else:
+
+                        ticket_confirmation = (
+                            f"Aapka support ticket #{ticket_number} "
+                            "already open hai. Aapki latest message "
+                            "usi request ke context mein handle ki ja rahi hai."
+                        )
+
+                    if reply:
+
+                        reply = (
+                            f"{reply}\n\n"
+                            f"{ticket_confirmation}"
+                        )
+
+                    else:
+
+                        reply = ticket_confirmation
+
+                    # ------------------------------------------------
+                    # NEW TICKET -> ADMIN WHATSAPP NOTIFICATION
+                    # ------------------------------------------------
+                    # Notify the admin only when this request created
+                    # a brand-new ticket. Existing/duplicate tickets
+                    # must not generate repeated admin alerts.
+                    if ticket_result.get("created"):
+
+                        admin_ticket_notified = (
+                            await notify_admin_new_support_ticket(
+                                ticket=ticket,
+                                customer_name=customer_memory.get("name"),
+                            )
+                        )
+
+                        if admin_ticket_notified:
+                            logger.info(
+                                "XYTRALYN TICKET | admin notified | "
+                                "phone=%s | ticket=%s",
+                                sender_phone,
+                                ticket_number,
+                            )
+                        else:
+                            # The ticket remains persisted even if the
+                            # admin WhatsApp notification fails.
+                            logger.warning(
+                                "XYTRALYN TICKET | admin notification failed | "
+                                "phone=%s | ticket=%s",
+                                sender_phone,
+                                ticket_number,
+                            )
+
+                    logger.info(
+                        "XYTRALYN TICKET | customer notification prepared | "
+                        "phone=%s | ticket=%s | created=%s | duplicate=%s",
+                        sender_phone,
+                        ticket_number,
+                        ticket_result.get("created"),
+                        ticket_result.get("duplicate"),
+                    )
+
+                else:
+
+                    logger.warning(
+                        "Support ticket was requested but was not persisted | "
+                        "phone=%s",
+                        sender_phone,
+                    )
+
+            if not reply:
+
+                logger.error(
+                    "Support agent returned empty reply | phone=%s",
+                    sender_phone,
+                )
+
+                return None
+
+        else:
+
+            # ------------------------------------------------
+            # EXISTING AI FLOW — UNCHANGED
+            # ------------------------------------------------
+
+            reply = await generate_agent_reply(
+                user_message=user_message,
+                history=history,
+                customer_memory=customer_context,
+                agent_name=agent_name,
+                business_name=BUSINESS_NAME,
+            )
+
+            if not reply:
+
+                logger.error(
+                    "AI returned empty reply | phone=%s",
+                    sender_phone,
+                )
+
+                return None
+
+            reply = str(reply).strip()
+
+            if not reply:
+                return None
 
         # ====================================================
         # 10. SAVE ASSISTANT MESSAGE
