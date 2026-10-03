@@ -20,7 +20,6 @@ logger = logging.getLogger(__name__)
 # PART 1/4
 # ============================================================
 
-
 # ============================================================
 # CONFIGURATION
 # ============================================================
@@ -611,18 +610,6 @@ def extract_interested_agent(text: str) -> Optional[str]:
             value=re.sub(r"^(?:an?|the)\s+","",value,flags=re.I).strip()
             if 2 <= len(value) <= 80:
                 return value
-    return None
-    lower = text.lower()
-    patterns = {
-        "sales": ["sales agent", "sales automation", "sales ke liye", "sales chahiye", "sales mein"],
-        "support": ["support agent", "customer support", "support automation", "support chahiye"],
-        "hr": ["hr agent", "hr automation", "recruitment agent", "hiring agent", "hr chahiye"],
-        "accountant": ["accountant agent", "accounting agent", "accountant chahiye", "accounting automation"],
-        "research": ["research agent", "research automation", "research chahiye", "market research"],
-    }
-    for agent, phrases in patterns.items():
-        if any(phrase in lower for phrase in phrases):
-            return agent
     return None
 
 def get_groq_client() -> Optional[AsyncGroq]:

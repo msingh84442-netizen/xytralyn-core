@@ -1,13 +1,15 @@
 """
 Xytralyn Ticket Service
 -----------------------
-Step 3 of the Support Agent integration.
+Multi-tenant Support Ticket Service.
 
 Responsibilities:
-- Create support tickets in the existing SQLAlchemy database.
+- Create support tickets in the SQLAlchemy database.
 - Generate unique human-readable ticket numbers.
-- Avoid unnecessary duplicate open tickets for the same customer/category.
+- Prevent unnecessary duplicate open tickets.
+- Keep all ticket queries tenant-scoped.
 - Update ticket status and priority.
+- Assign tickets safely.
 - Fetch tickets safely.
 - Keep database logic separate from support_agent.py and chat.py.
 
@@ -26,14 +28,20 @@ import logging
 import re
 import uuid
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
 
 from app.models import Ticket
 
+
 logger = logging.getLogger(__name__)
 
+
+# ============================================================================
+# CONSTANTS
+# ============================================================================
 
 VALID_CATEGORIES = {
     "technical",
@@ -59,11 +67,27 @@ VALID_STATUSES = {
 }
 
 
-# ---------------------------------------------------------------------------
-# Basic helpers
-# ---------------------------------------------------------------------------
+OPEN_STATUSES = {
+    "open",
+    "in_progress",
+}
+
+
+CLOSED_STATUSES = {
+    "resolved",
+    "closed",
+}
+
+
+# ============================================================================
+# BASIC HELPERS
+# ============================================================================
+
 
 def _clean_text(value: Any) -> str:
+    """
+    Safely convert a value into normalized text.
+    """
     if value is None:
         return ""
 
@@ -72,14 +96,14 @@ def _clean_text(value: Any) -> str:
 
 def normalize_customer_phone(phone: Any) -> Optional[str]:
     """
-    Normalize an Indian WhatsApp phone number to the same 10-digit format
-    already used by the Xytralyn lead/customer flow.
+    Normalize an Indian WhatsApp phone number into 10-digit format.
 
     Examples:
         +91 98765 43210 -> 9876543210
         919876543210    -> 9876543210
         9876543210      -> 9876543210
     """
+
     if phone is None:
         return None
 
@@ -98,6 +122,10 @@ def normalize_customer_phone(phone: Any) -> Optional[str]:
 
 
 def _safe_category(category: Any) -> str:
+    """
+    Normalize and validate ticket category.
+    """
+
     value = _clean_text(category).lower()
 
     if value in VALID_CATEGORIES:
@@ -107,6 +135,10 @@ def _safe_category(category: Any) -> str:
 
 
 def _safe_priority(priority: Any) -> str:
+    """
+    Normalize and validate ticket priority.
+    """
+
     value = _clean_text(priority).lower()
 
     if value in VALID_PRIORITIES:
@@ -116,6 +148,10 @@ def _safe_priority(priority: Any) -> str:
 
 
 def _safe_status(status: Any) -> str:
+    """
+    Normalize and validate ticket status.
+    """
+
     value = _clean_text(status).lower()
 
     if value in VALID_STATUSES:
@@ -124,32 +160,58 @@ def _safe_status(status: Any) -> str:
     return "open"
 
 
+def _validate_tenant_id(tenant_id: Any) -> bool:
+    """
+    Validate that a tenant_id has been supplied.
+
+    Tenant isolation is mandatory for ticket operations.
+    """
+
+    return tenant_id is not None
+
+
 def _generate_ticket_number() -> str:
     """
     Generate a readable ticket identifier.
 
-    UUID suffix makes collisions extremely unlikely while the date keeps
-    tickets easy for admins to recognize.
+    Example:
+        XYT-20261001-A1B2C3D4
     """
+
     date_part = datetime.utcnow().strftime("%Y%m%d")
     random_part = uuid.uuid4().hex[:8].upper()
 
     return f"XYT-{date_part}-{random_part}"
 
 
-# ---------------------------------------------------------------------------
-# Ticket serialization
-# ---------------------------------------------------------------------------
+# ============================================================================
+# TICKET SERIALIZATION
+# ============================================================================
 
-def ticket_to_dict(ticket: Optional[Ticket]) -> Optional[Dict[str, Any]]:
-    """Convert a Ticket SQLAlchemy object into a JSON-friendly dictionary."""
+
+def ticket_to_dict(
+    ticket: Optional[Ticket],
+) -> Optional[Dict[str, Any]]:
+    """
+    Convert a Ticket SQLAlchemy object into a JSON-friendly dictionary.
+    """
+
     if ticket is None:
         return None
 
     return {
         "id": str(ticket.id) if ticket.id is not None else None,
+        "tenant_id": (
+            str(ticket.tenant_id)
+            if ticket.tenant_id is not None
+            else None
+        ),
         "ticket_number": ticket.ticket_number,
-        "user_id": str(ticket.user_id) if ticket.user_id is not None else None,
+        "user_id": (
+            str(ticket.user_id)
+            if ticket.user_id is not None
+            else None
+        ),
         "customer_phone": ticket.customer_phone,
         "subject": ticket.subject,
         "description": ticket.description,
@@ -175,24 +237,40 @@ def ticket_to_dict(ticket: Optional[Ticket]) -> Optional[Dict[str, Any]]:
     }
 
 
-# ---------------------------------------------------------------------------
-# Duplicate detection
-# ---------------------------------------------------------------------------
+# ============================================================================
+# DUPLICATE DETECTION
+# ============================================================================
+
 
 def find_existing_open_ticket(
-    db,
+    db: Session,
     customer_phone: str,
     category: str = "general",
+    tenant_id=None,
 ) -> Optional[Ticket]:
     """
-    Find an existing unresolved ticket for this customer/category.
+    Find an existing unresolved ticket.
 
-    This prevents a customer sending several messages about the same
-    unresolved issue from creating a new ticket every time.
+    IMPORTANT:
+    The search is ALWAYS restricted to the supplied tenant_id.
+
+    This prevents:
+        Tenant A customer -> seeing Tenant B ticket
+
+    and prevents duplicate tickets for the same customer/category
+    inside the same tenant.
     """
+
     phone = normalize_customer_phone(customer_phone)
 
     if not phone:
+        return None
+
+    if not _validate_tenant_id(tenant_id):
+        logger.warning(
+            "XYTRALYN TICKET | duplicate search rejected | "
+            "missing tenant_id"
+        )
         return None
 
     category = _safe_category(category)
@@ -200,46 +278,69 @@ def find_existing_open_ticket(
     return (
         db.query(Ticket)
         .filter(
+            Ticket.tenant_id == tenant_id,
             Ticket.customer_phone == phone,
             Ticket.category == category,
-            Ticket.status.in_(["open", "in_progress"]),
+            Ticket.status.in_(list(OPEN_STATUSES)),
         )
         .order_by(Ticket.created_at.desc())
         .first()
     )
 
 
-# ---------------------------------------------------------------------------
-# Create ticket
-# ---------------------------------------------------------------------------
+# ============================================================================
+# CREATE TICKET
+# ============================================================================
+
 
 def create_ticket(
-    db,
+    db: Session,
     customer_phone: str,
     subject: str,
     description: str,
     category: str = "general",
     priority: str = "medium",
     user_id=None,
+    tenant_id=None,
     assigned_to: Optional[str] = None,
     prevent_duplicate: bool = True,
 ) -> Dict[str, Any]:
     """
     Create a support ticket.
 
+    Tenant isolation is mandatory.
+
     Returns:
         {
             "success": bool,
             "created": bool,
             "duplicate": bool,
-            "ticket": {...} | None,
-            "error": str | None,
+            "ticket": dict | None,
+            "error": str | None
+        }
+    """
+
+    # ------------------------------------------------------------------
+    # Tenant validation
+    # ------------------------------------------------------------------
+
+    if not _validate_tenant_id(tenant_id):
+        logger.error(
+            "XYTRALYN TICKET | create rejected | missing tenant_id"
+        )
+
+        return {
+            "success": False,
+            "created": False,
+            "duplicate": False,
+            "ticket": None,
+            "error": "Tenant ID is required.",
         }
 
-    If an unresolved ticket already exists for the same customer/category,
-    that ticket is returned instead of creating another one when
-    prevent_duplicate=True.
-    """
+    # ------------------------------------------------------------------
+    # Phone validation
+    # ------------------------------------------------------------------
+
     phone = normalize_customer_phone(customer_phone)
 
     if not phone:
@@ -250,6 +351,10 @@ def create_ticket(
             "ticket": None,
             "error": "Invalid customer phone number.",
         }
+
+    # ------------------------------------------------------------------
+    # Normalize values
+    # ------------------------------------------------------------------
 
     subject = _clean_text(subject)
     description = _clean_text(description)
@@ -262,17 +367,23 @@ def create_ticket(
     if not description:
         description = subject
 
+    # ------------------------------------------------------------------
+    # Duplicate prevention
+    # ------------------------------------------------------------------
+
     if prevent_duplicate:
         existing = find_existing_open_ticket(
             db=db,
             customer_phone=phone,
             category=category,
+            tenant_id=tenant_id,
         )
 
         if existing is not None:
             logger.info(
                 "XYTRALYN TICKET | duplicate prevented | "
-                "ticket=%s phone=%s category=%s",
+                "tenant=%s ticket=%s phone=%s category=%s",
+                tenant_id,
                 existing.ticket_number,
                 phone,
                 category,
@@ -286,7 +397,12 @@ def create_ticket(
                 "error": None,
             }
 
+    # ------------------------------------------------------------------
+    # Create ticket object
+    # ------------------------------------------------------------------
+
     ticket = Ticket(
+        tenant_id=tenant_id,
         user_id=user_id,
         customer_phone=phone,
         ticket_number=_generate_ticket_number(),
@@ -300,6 +416,10 @@ def create_ticket(
 
     db.add(ticket)
 
+    # ------------------------------------------------------------------
+    # Commit
+    # ------------------------------------------------------------------
+
     try:
         db.commit()
         db.refresh(ticket)
@@ -307,14 +427,22 @@ def create_ticket(
     except IntegrityError:
         db.rollback()
 
-        # A ticket-number collision is extraordinarily unlikely, but a retry
-        # keeps the service safe if it ever happens.
+        logger.warning(
+            "XYTRALYN TICKET | integrity error | "
+            "tenant=%s ticket=%s",
+            tenant_id,
+            ticket.ticket_number,
+        )
+
+        # Retry with a fresh ticket number.
         ticket.ticket_number = _generate_ticket_number()
+
         db.add(ticket)
 
         try:
             db.commit()
             db.refresh(ticket)
+
         except Exception as retry_error:
             db.rollback()
 
@@ -334,7 +462,9 @@ def create_ticket(
         db.rollback()
 
         logger.exception(
-            "XYTRALYN TICKET | database create failed"
+            "XYTRALYN TICKET | database create failed | "
+            "tenant=%s",
+            tenant_id,
         )
 
         return {
@@ -345,8 +475,14 @@ def create_ticket(
             "error": str(exc),
         }
 
+    # ------------------------------------------------------------------
+    # Success
+    # ------------------------------------------------------------------
+
     logger.info(
-        "XYTRALYN TICKET | created | ticket=%s phone=%s category=%s priority=%s",
+        "XYTRALYN TICKET | created | "
+        "tenant=%s ticket=%s phone=%s category=%s priority=%s",
+        tenant_id,
         ticket.ticket_number,
         phone,
         category,
@@ -362,67 +498,165 @@ def create_ticket(
     }
 
 
-# ---------------------------------------------------------------------------
-# Fetch tickets
-# ---------------------------------------------------------------------------
+# ============================================================================
+# GET SINGLE TICKET
+# ============================================================================
+
 
 def get_ticket(
-    db,
+    db: Session,
     ticket_number: str,
+    tenant_id=None,
 ) -> Optional[Ticket]:
-    """Fetch one ticket by its public ticket number."""
+    """
+    Fetch one ticket by ticket number.
+
+    IMPORTANT:
+    tenant_id is mandatory for safe lookup.
+    """
+
     number = _clean_text(ticket_number)
 
     if not number:
         return None
 
+    if not _validate_tenant_id(tenant_id):
+        logger.warning(
+            "XYTRALYN TICKET | get rejected | missing tenant_id"
+        )
+        return None
+
     return (
         db.query(Ticket)
-        .filter(Ticket.ticket_number == number)
+        .filter(
+            Ticket.ticket_number == number,
+            Ticket.tenant_id == tenant_id,
+        )
         .first()
     )
 
 
+# ============================================================================
+# GET CUSTOMER TICKETS
+# ============================================================================
+
+
 def get_customer_tickets(
-    db,
+    db: Session,
     customer_phone: str,
+    tenant_id=None,
     include_closed: bool = True,
-):
-    """Return tickets belonging only to the supplied customer phone."""
+) -> List[Ticket]:
+    """
+    Return tickets belonging only to the supplied customer
+    and supplied tenant.
+    """
+
     phone = normalize_customer_phone(customer_phone)
 
     if not phone:
         return []
 
+    if not _validate_tenant_id(tenant_id):
+        logger.warning(
+            "XYTRALYN TICKET | customer tickets rejected | "
+            "missing tenant_id"
+        )
+        return []
+
     query = (
         db.query(Ticket)
-        .filter(Ticket.customer_phone == phone)
+        .filter(
+            Ticket.tenant_id == tenant_id,
+            Ticket.customer_phone == phone,
+        )
         .order_by(Ticket.created_at.desc())
     )
 
     if not include_closed:
         query = query.filter(
-            Ticket.status.in_(["open", "in_progress"])
+            Ticket.status.in_(list(OPEN_STATUSES))
         )
 
     return query.all()
 
 
-# ---------------------------------------------------------------------------
-# Update ticket
-# ---------------------------------------------------------------------------
+# ============================================================================
+# GET ALL TENANT TICKETS
+# ============================================================================
+
+
+def get_tenant_tickets(
+    db: Session,
+    tenant_id=None,
+    status: Optional[str] = None,
+    priority: Optional[str] = None,
+    category: Optional[str] = None,
+    limit: int = 100,
+) -> List[Ticket]:
+    """
+    Fetch tickets belonging to one tenant.
+
+    This function is intended for admin/dashboard/service usage.
+    """
+
+    if not _validate_tenant_id(tenant_id):
+        logger.warning(
+            "XYTRALYN TICKET | tenant ticket listing rejected | "
+            "missing tenant_id"
+        )
+        return []
+
+    # Protect against unreasonable limits.
+    limit = max(1, min(int(limit), 500))
+
+    query = (
+        db.query(Ticket)
+        .filter(Ticket.tenant_id == tenant_id)
+        .order_by(Ticket.created_at.desc())
+    )
+
+    if status:
+        query = query.filter(
+            Ticket.status == _safe_status(status)
+        )
+
+    if priority:
+        query = query.filter(
+            Ticket.priority == _safe_priority(priority)
+        )
+
+    if category:
+        query = query.filter(
+            Ticket.category == _safe_category(category)
+        )
+
+    return query.limit(limit).all()
+
+
+# ============================================================================
+# UPDATE TICKET STATUS
+# ============================================================================
+
 
 def update_ticket_status(
-    db,
+    db: Session,
     ticket_number: str,
     status: str,
+    tenant_id=None,
 ) -> Dict[str, Any]:
     """
     Update a ticket status.
 
-    When status becomes resolved/closed, resolved_at is populated.
+    When status becomes resolved/closed,
+    resolved_at is populated.
     """
-    ticket = get_ticket(db, ticket_number)
+
+    ticket = get_ticket(
+        db=db,
+        ticket_number=ticket_number,
+        tenant_id=tenant_id,
+    )
 
     if ticket is None:
         return {
@@ -435,7 +669,7 @@ def update_ticket_status(
 
     ticket.status = new_status
 
-    if new_status in {"resolved", "closed"}:
+    if new_status in CLOSED_STATUSES:
         ticket.resolved_at = datetime.utcnow()
     else:
         ticket.resolved_at = None
@@ -450,7 +684,9 @@ def update_ticket_status(
         db.rollback()
 
         logger.exception(
-            "XYTRALYN TICKET | status update failed | ticket=%s",
+            "XYTRALYN TICKET | status update failed | "
+            "tenant=%s ticket=%s",
+            tenant_id,
             ticket_number,
         )
 
@@ -461,7 +697,9 @@ def update_ticket_status(
         }
 
     logger.info(
-        "XYTRALYN TICKET | status updated | ticket=%s status=%s",
+        "XYTRALYN TICKET | status updated | "
+        "tenant=%s ticket=%s status=%s",
+        tenant_id,
         ticket.ticket_number,
         new_status,
     )
@@ -473,13 +711,26 @@ def update_ticket_status(
     }
 
 
+# ============================================================================
+# UPDATE TICKET PRIORITY
+# ============================================================================
+
+
 def update_ticket_priority(
-    db,
+    db: Session,
     ticket_number: str,
     priority: str,
+    tenant_id=None,
 ) -> Dict[str, Any]:
-    """Update a ticket priority."""
-    ticket = get_ticket(db, ticket_number)
+    """
+    Update a ticket priority.
+    """
+
+    ticket = get_ticket(
+        db=db,
+        ticket_number=ticket_number,
+        tenant_id=tenant_id,
+    )
 
     if ticket is None:
         return {
@@ -499,7 +750,9 @@ def update_ticket_priority(
         db.rollback()
 
         logger.exception(
-            "XYTRALYN TICKET | priority update failed | ticket=%s",
+            "XYTRALYN TICKET | priority update failed | "
+            "tenant=%s ticket=%s",
+            tenant_id,
             ticket_number,
         )
 
@@ -509,6 +762,14 @@ def update_ticket_priority(
             "error": str(exc),
         }
 
+    logger.info(
+        "XYTRALYN TICKET | priority updated | "
+        "tenant=%s ticket=%s priority=%s",
+        tenant_id,
+        ticket.ticket_number,
+        ticket.priority,
+    )
+
     return {
         "success": True,
         "ticket": ticket_to_dict(ticket),
@@ -516,13 +777,28 @@ def update_ticket_priority(
     }
 
 
+# ============================================================================
+# ASSIGN TICKET
+# ============================================================================
+
+
 def assign_ticket(
-    db,
+    db: Session,
     ticket_number: str,
     assigned_to: Optional[str],
+    tenant_id=None,
 ) -> Dict[str, Any]:
-    """Assign or unassign a ticket."""
-    ticket = get_ticket(db, ticket_number)
+    """
+    Assign or unassign a ticket.
+
+    Tenant isolation is enforced through get_ticket().
+    """
+
+    ticket = get_ticket(
+        db=db,
+        ticket_number=ticket_number,
+        tenant_id=tenant_id,
+    )
 
     if ticket is None:
         return {
@@ -542,7 +818,9 @@ def assign_ticket(
         db.rollback()
 
         logger.exception(
-            "XYTRALYN TICKET | assignment update failed | ticket=%s",
+            "XYTRALYN TICKET | assignment update failed | "
+            "tenant=%s ticket=%s",
+            tenant_id,
             ticket_number,
         )
 
@@ -552,6 +830,14 @@ def assign_ticket(
             "error": str(exc),
         }
 
+    logger.info(
+        "XYTRALYN TICKET | assignment updated | "
+        "tenant=%s ticket=%s assigned_to=%s",
+        tenant_id,
+        ticket.ticket_number,
+        ticket.assigned_to,
+    )
+
     return {
         "success": True,
         "ticket": ticket_to_dict(ticket),
@@ -559,17 +845,149 @@ def assign_ticket(
     }
 
 
+# ============================================================================
+# CLOSE TICKET
+# ============================================================================
+
+
+def close_ticket(
+    db: Session,
+    ticket_number: str,
+    tenant_id=None,
+) -> Dict[str, Any]:
+    """
+    Convenience function to close a ticket.
+    """
+
+    return update_ticket_status(
+        db=db,
+        ticket_number=ticket_number,
+        status="closed",
+        tenant_id=tenant_id,
+    )
+
+
+# ============================================================================
+# RESOLVE TICKET
+# ============================================================================
+
+
+def resolve_ticket(
+    db: Session,
+    ticket_number: str,
+    tenant_id=None,
+) -> Dict[str, Any]:
+    """
+    Convenience function to resolve a ticket.
+    """
+
+    return update_ticket_status(
+        db=db,
+        ticket_number=ticket_number,
+        status="resolved",
+        tenant_id=tenant_id,
+    )
+
+
+# ============================================================================
+# REOPEN TICKET
+# ============================================================================
+
+
+def reopen_ticket(
+    db: Session,
+    ticket_number: str,
+    tenant_id=None,
+) -> Dict[str, Any]:
+    """
+    Convenience function to reopen a ticket.
+    """
+
+    return update_ticket_status(
+        db=db,
+        ticket_number=ticket_number,
+        status="open",
+        tenant_id=tenant_id,
+    )
+
+
+# ============================================================================
+# TICKET COUNTS
+# ============================================================================
+
+
+def count_tenant_tickets(
+    db: Session,
+    tenant_id=None,
+) -> Dict[str, int]:
+    """
+    Return ticket counts for one tenant.
+
+    Example:
+        {
+            "total": 10,
+            "open": 4,
+            "in_progress": 2,
+            "resolved": 3,
+            "closed": 1
+        }
+    """
+
+    if not _validate_tenant_id(tenant_id):
+        return {
+            "total": 0,
+            "open": 0,
+            "in_progress": 0,
+            "resolved": 0,
+            "closed": 0,
+        }
+
+    tickets = (
+        db.query(Ticket)
+        .filter(Ticket.tenant_id == tenant_id)
+        .all()
+    )
+
+    result = {
+        "total": len(tickets),
+        "open": 0,
+        "in_progress": 0,
+        "resolved": 0,
+        "closed": 0,
+    }
+
+    for ticket in tickets:
+        status = _safe_status(ticket.status)
+
+        if status in result:
+            result[status] += 1
+
+    return result
+
+
+# ============================================================================
+# PUBLIC API
+# ============================================================================
+
+
 __all__ = [
     "VALID_CATEGORIES",
     "VALID_PRIORITIES",
     "VALID_STATUSES",
+    "OPEN_STATUSES",
+    "CLOSED_STATUSES",
     "normalize_customer_phone",
     "ticket_to_dict",
     "find_existing_open_ticket",
     "create_ticket",
     "get_ticket",
     "get_customer_tickets",
+    "get_tenant_tickets",
     "update_ticket_status",
     "update_ticket_priority",
     "assign_ticket",
+    "close_ticket",
+    "resolve_ticket",
+    "reopen_ticket",
+    "count_tenant_tickets",
 ]

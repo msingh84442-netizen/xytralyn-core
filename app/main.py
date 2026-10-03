@@ -1,14 +1,36 @@
 from fastapi import FastAPI
-from app.database import engine, Base
+
 from app.routes import chat, leads
 
-Base.metadata.create_all(bind=engine)
 
-app = FastAPI(title="Xytralyn Core Engine")
+app = FastAPI(
+    title="Xytralyn Core Engine",
+    version="1.0.0",
+)
 
-app.include_router(chat.router, prefix="/chat")
-app.include_router(leads.router)
+
+# ------------------------------------------------------------
+# API ROUTES
+# ------------------------------------------------------------
+
+app.include_router(
+    chat.router,
+    prefix="/chat",
+)
+
+app.include_router(
+    leads.router,
+)
+
+
+# ------------------------------------------------------------
+# HEALTH / ROOT ENDPOINT
+# ------------------------------------------------------------
 
 @app.get("/")
 def home():
-    return {"status": "Xytralyn Engine Running", "mode": "Live"}
+    return {
+        "status": "Xytralyn Engine Running",
+        "mode": "Live",
+        "architecture": "Multi-Tenant",
+    }
