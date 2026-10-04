@@ -78,7 +78,7 @@ def upgrade() -> None:
     op.create_table(
         "memberships",
         sa.Column("id", sa.String(length=36), primary_key=True),
-        sa.Column("user_id", sa.String(length=36), nullable=False),
+        sa.Column("user_id", sa.String(length=36), nullable=True),
         sa.Column("tenant_id", sa.String(length=36), nullable=False),
         sa.Column(
             "role",
@@ -98,11 +98,7 @@ def upgrade() -> None:
             nullable=False,
             server_default=sa.func.now(),
         ),
-        sa.ForeignKeyConstraint(
-            ["user_id"],
-            ["users.id"],
-            name="fk_memberships_user_id",
-        ),
+        # fk_memberships_user_id omitted
         sa.ForeignKeyConstraint(
             ["tenant_id"],
             ["tenants.id"],
@@ -304,11 +300,7 @@ def upgrade() -> None:
             ["tenants.id"],
             name="fk_tickets_tenant_id",
         ),
-        sa.ForeignKeyConstraint(
-            ["user_id"],
-            ["users.id"],
-            name="fk_tickets_user_id",
-        ),
+        # fk_tickets_user_id omitted
         sa.UniqueConstraint(
             "ticket_number",
             name="uq_tickets_ticket_number",
