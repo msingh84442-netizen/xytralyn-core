@@ -20,7 +20,12 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    try:
+    conn = op.get_bind()
+    inspector = sa.inspect(conn)
+    existing_tables = inspector.get_table_names()
+
+    # 1. Tenants table
+    if "tenants" not in existing_tables:
         op.create_table(
             "tenants",
             sa.Column("id", sa.String(length=36), primary_key=True),
@@ -34,10 +39,9 @@ def upgrade() -> None:
         )
         op.create_index("ix_tenants_slug", "tenants", ["slug"], unique=True)
         op.create_index("ix_tenants_status", "tenants", ["status"], unique=False)
-    except Exception as e:
-        print(f"Skipping tenants creation: {e}")
 
-    try:
+    # 2. Memberships table
+    if "memberships" not in existing_tables:
         op.create_table(
             "memberships",
             sa.Column("id", sa.String(length=36), primary_key=True),
@@ -50,31 +54,34 @@ def upgrade() -> None:
         )
         op.create_index("ix_memberships_user_id", "memberships", ["user_id"], unique=False)
         op.create_index("ix_memberships_tenant_id", "memberships", ["tenant_id"], unique=False)
-    except Exception as e:
-        print(f"Skipping memberships creation: {e}")
 
-    try:
-        with op.batch_alter_table("leads", schema=None) as batch_op:
-            batch_op.add_column(sa.Column("tenant_id", sa.String(length=36), nullable=True))
-            batch_op.create_index("ix_leads_tenant_id", ["tenant_id"], unique=False)
-    except Exception as e:
-        print(f"Skipping leads alter: {e}")
+    # 3. Add tenant_id to leads
+    if "leads" in existing_tables:
+        lead_cols = [c["name"] for c in inspector.get_columns("leads")]
+        if "tenant_id" not in lead_cols:
+            with op.batch_alter_table("leads", schema=None) as batch_op:
+                batch_op.add_column(sa.Column("tenant_id", sa.String(length=36), nullable=True))
+                batch_op.create_index("ix_leads_tenant_id", ["tenant_id"], unique=False)
 
-    try:
-        with op.batch_alter_table("messages", schema=None) as batch_op:
-            batch_op.add_column(sa.Column("tenant_id", sa.String(length=36), nullable=True))
-            batch_op.create_index("ix_messages_tenant_id", ["tenant_id"], unique=False)
-    except Exception as e:
-        print(f"Skipping messages alter: {e}")
+    # 4. Add tenant_id to messages
+    if "messages" in existing_tables:
+        msg_cols = [c["name"] for c in inspector.get_columns("messages")]
+        if "tenant_id" not in msg_cols:
+            with op.batch_alter_table("messages", schema=None) as batch_op:
+                batch_op.add_column(sa.Column("tenant_id", sa.String(length=36), nullable=True))
+                batch_op.create_index("ix_messages_tenant_id", ["tenant_id"], unique=False)
 
+    # 5. Seed default tenant if not present
     default_tenant_id = str(uuid.uuid4())
-    try:
-        op.execute(
+    existing_tenant = conn.execute(
+        sa.text("SELECT id FROM tenants WHERE slug = 'xytralyn'")
+    ).fetchone()
+    if not existing_tenant:
+        conn.execute(
             sa.text(
                 """
                 INSERT INTO tenants (id, name, slug, industry, status)
                 VALUES (:id, :name, :slug, :industry, :status)
-                ON CONFLICT (slug) DO NOTHING
                 """
             ).bindparams(
                 id=default_tenant_id,
@@ -84,10 +91,9 @@ def upgrade() -> None:
                 status="active",
             )
         )
-    except Exception as e:
-        print(f"Skipping default tenant: {e}")
 
-    try:
+    # 6. Tickets table
+    if "tickets" not in existing_tables:
         op.create_table(
             "tickets",
             sa.Column("id", sa.String(length=36), primary_key=True),
@@ -111,8 +117,6 @@ def upgrade() -> None:
         op.create_index("ix_tickets_ticket_number", "tickets", ["ticket_number"], unique=True)
         op.create_index("ix_tickets_status", "tickets", ["status"], unique=False)
         op.create_index("ix_tickets_priority", "tickets", ["priority"], unique=False)
-    except Exception as e:
-        print(f"Skipping tickets creation: {e}")
 
 
 def downgrade() -> None:
