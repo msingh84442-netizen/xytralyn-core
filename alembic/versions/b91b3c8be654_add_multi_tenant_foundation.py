@@ -99,11 +99,7 @@ def upgrade() -> None:
             server_default=sa.func.now(),
         ),
         # fk_memberships_user_id omitted
-        sa.ForeignKeyConstraint(
-            ["tenant_id"],
-            ["tenants.id"],
-            name="fk_memberships_tenant_id",
-        ),
+        # fk_memberships_tenant_id omitted
         sa.UniqueConstraint(
             "user_id",
             "tenant_id",
@@ -295,11 +291,7 @@ def upgrade() -> None:
             sa.DateTime(),
             nullable=True,
         ),
-        sa.ForeignKeyConstraint(
-            ["tenant_id"],
-            ["tenants.id"],
-            name="fk_tickets_tenant_id",
-        ),
+        # fk_tickets_tenant_id omitted
         # fk_tickets_user_id omitted
         sa.UniqueConstraint(
             "ticket_number",
@@ -387,3 +379,4 @@ def downgrade() -> None:
     op.drop_index("ix_tenants_status", table_name="tenants")
     op.drop_index("ix_tenants_slug", table_name="tenants")
     op.drop_table("tenants")
+
