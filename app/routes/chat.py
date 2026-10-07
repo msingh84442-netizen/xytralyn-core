@@ -1838,6 +1838,12 @@ async def meta_whatsapp_webhook(
         "message_text",
         "",
     )
+    logger.warning(
+    "META MESSAGE DEBUG | id=%s | phone=%s | text=%s",
+    message_id,
+    sender_phone,
+    user_message,
+    )
     phone_number_id = parsed.get("phone_number_id", "")
     # ========================================================
     # DUPLICATE PROTECTION
