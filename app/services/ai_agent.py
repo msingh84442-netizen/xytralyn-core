@@ -581,36 +581,126 @@ def _demo_context_from_history(history: Optional[List[Dict[str, Any]]]) -> bool:
     previous = _last_assistant_text(history).lower()
     return bool(re.search(r"\b(?:demo|preferred slot|date and time|date/time|kaunsa date|kaunsa time|which date|which time)\b", previous))
 
-def extract_interested_agent(text: str) -> Optional[str]:
-    """Extract the customer's requested AI agent/service without hard-coded customer data."""
+def extract_interested_agent(
+    text: str,
+) -> Optional[str]:
+    """Extract one or more customer-requested AI agents/services."""
+
     if not text:
         return None
-    clean = " ".join(str(text).strip().split())
+
+    clean = " ".join(
+        str(text).strip().split()
+    )
+
     lower = clean.lower()
-    canonical_patterns = [
-        ("Sales", r"\bsales(?:\s+agent)?\b"),
-        ("Support", r"\bsupport(?:\s+agent)?\b"),
-        ("HR", r"\b(?:hr|human\s+resources)(?:\s+agent)?\b"),
-        ("Accountant", r"\b(?:accountant|accounting)(?:\s+agent)?\b"),
-        ("Research", r"\bresearch(?:\s+agent)?\b"),
+
+    detected = []
+
+    def add_agent(name: str):
+        if name not in detected:
+            detected.append(name)
+
+    sales_patterns = [
+        r"\bsales(?:\s+agent)?\b",
+        r"\bleads?\b",
+        r"\blead\s+capture\b",
+        r"\blead\s+qualification\b",
+        r"\blead\s+follow[-\s]?ups?\b",
+        r"\bfollow[-\s]?ups?\b",
     ]
-    explicit_intent = re.search(r"\b(?:interested\s+in|want|need|chahiye|chahta(?:\s+hoon)?|chahti(?:\s+hoon)?|mujhe|we\s+need|i\s+need|i\s+want)\b", lower)
-    for canonical, pattern in canonical_patterns:
-        if re.search(pattern, lower) and (explicit_intent or re.search(pattern + r".{0,35}\b(?:chahiye|need|want|liye|lena|automation)\b", lower)):
-            return canonical
-    generic_patterns = [
-        r"\b(?:mujhe|we|i)\s+(?:an?\s+)?(.{2,80}?)\s+(?:ai\s+)?agent\s+(?:chahiye|need|want|lena|please)\b",
-        r"\b(.{2,80}?)\s+(?:ai\s+)?agent\s+(?:chahiye|need|want|lena)\b",
-        r"\b(?:interested\s+in|want|need)\s+(.{2,80}?)\s+(?:ai\s+)?agent\b",
+
+    support_patterns = [
+        r"\bsupport(?:\s+agent)?\b",
+        r"\bcustomer\s+support\b",
+        r"\bcustomer\s+queries?\b",
+        r"\bcomplaints?\b",
+        r"\bfaqs?\b",
     ]
-    for pattern in generic_patterns:
-        match=re.search(pattern,clean,flags=re.I)
-        if match:
-            value=re.sub(r"\s+"," ",match.group(1)).strip(" .,-:;")
-            value=re.sub(r"^(?:an?|the)\s+","",value,flags=re.I).strip()
-            if 2 <= len(value) <= 80:
-                return value
-    return None
+
+    hr_patterns = [
+        r"\bhr(?:\s+agent)?\b",
+        r"\bhuman\s+resources\b",
+        r"\brecruitment\b",
+        r"\bhiring\b",
+    ]
+
+    accountant_patterns = [
+        r"\baccount(?:ant|ing)(?:\s+agent)?\b",
+        r"\binvoices?\b",
+        r"\bgst\b",
+        r"\bexpenses?\b",
+        r"\bprofit\s+and\s+loss\b",
+    ]
+
+    research_patterns = [
+        r"\bresearch(?:\s+agent)?\b",
+        r"\bmarket\s+research\b",
+        r"\bcompetitor\s+research\b",
+    ]
+
+    agent_groups = [
+        ("Sales", sales_patterns),
+        ("Support", support_patterns),
+        ("HR", hr_patterns),
+        ("Accountant", accountant_patterns),
+        ("Research", research_patterns),
+    ]
+
+    for agent_name, patterns in agent_groups:
+        if any(
+            re.search(pattern, lower)
+            for pattern in patterns
+        ):
+            add_agent(agent_name)
+
+    # Generic agent request fallback.
+    if not detected:
+
+        generic_patterns = [
+            r"\b(?:mujhe|we|i)\s+(?:an?\s+)?(.{2,80}?)\s+(?:ai\s+)?agent\s+(?:chahiye|need|want|lena|please)\b",
+
+            r"\b(.{2,80}?)\s+(?:ai\s+)?agent\s+(?:chahiye|need|want|lena)\b",
+
+            r"\b(?:interested\s+in|want|need)\s+(.{2,80}?)\s+(?:ai\s+)?agent\b",
+        ]
+
+        for pattern in generic_patterns:
+
+            match = re.search(
+                pattern,
+                clean,
+                flags=re.I,
+            )
+
+            if match:
+
+                value = re.sub(
+                    r"\s+",
+                    " ",
+                    match.group(1),
+                ).strip(
+                    " .,-:;"
+                )
+
+                value = re.sub(
+                    r"^(?:an?|the)\s+",
+                    "",
+                    value,
+                    flags=re.I,
+                ).strip()
+
+                if 2 <= len(value) <= 80:
+                    return value
+
+                break
+
+    if not detected:
+        return None
+
+    return " + ".join(detected)
+
+
 
 def get_groq_client() -> Optional[AsyncGroq]:
     api_key = os.getenv("GROQ_API_KEY")
@@ -914,145 +1004,162 @@ def fallback_message() -> str:
 
 def detect_agent(
     user_message: str,
+    history: Optional[List[Dict[str, Any]]] = None,
+    customer_memory: str = "",
 ) -> str:
+    """Route the current request to the most appropriate agent."""
 
-    text = (
-        user_message or ""
-    ).lower().strip()
+    text = " ".join(
+        str(user_message or "").strip().split()
+    ).lower()
 
-    support_keywords = [
-    "technical issue",
-    "technical problem",
+    history = history or []
 
-    # Login / account problems
-    "login problem",
-    "login issue",
-    "login nhi ho raha",
-    "login nahi ho raha",
-    "login nahin ho raha",
-    "login ni ho raha",
-    "login nhi ho rha",
-    "login nahi ho rha",
-    "login nahin ho rha",
-    "log in nahi ho raha",
-    "log in nhi ho raha",
-    "sign in nahi ho raha",
-    "signin nahi ho raha",
-    "account login",
-    "account access",
-
-    # General technical problems
-    "not working",
-    "work nahi kar raha",
-    "kaam nahi kar raha",
-    "kaam nhi kar raha",
-    "error aa raha",
-    "error aa rha",
-    "error hai",
-    "problem aa rahi",
-    "problem aa rha",
-    "problem ho rahi",
-    "problem ho raha",
-    "issue aa raha",
-    "issue aa rahi",
-
-    # Help / support
-    "support chahiye",
-    "support karo",
-    "support please",
-    "help chahiye",
-    "please help",
-    "help me",
-    "meri help karo",
-    "madad chahiye",
-
-    # Complaints
-    "refund chahiye",
-    "complaint",
-    "complain",
-    "bug",
-]
-
-    hr_keywords = [
-        "job application",
-        "candidate screening",
-        "candidate shortlist",
-        "interview schedule",
-        "recruitment",
-        "hiring",
-        "employee",
-        "hr",
+    sales_patterns = [
+        r"\bsales\b",
+        r"\bleads?\b",
+        r"\blead\s+capture\b",
+        r"\blead\s+qualification\b",
+        r"\blead\s+follow[-\s]?ups?\b",
+        r"\bfollow[-\s]?ups?\b",
+        r"\bdemo\b",
+        r"\bbook\s+(?:a\s+)?demo\b",
+        r"\bpricing\b",
+        r"\bplans?\b",
+        r"\bbuy\b",
+        r"\bpackage\b",
     ]
 
-    accountant_keywords = [
-        "invoice banao",
-        "invoice banana",
-        "invoice",
-        "gst calculate",
-        "gst calculation",
-        "gst",
-        "p&l report",
-        "profit loss",
-        "expense report",
-        "expense",
+    support_patterns = [
+        r"\bsupport\b",
+        r"\bcustomer\s+support\b",
+        r"\bcustomer\s+queries?\b",
+        r"\bcomplaints?\b",
+        r"\bfaqs?\b",
+        r"\bissue\b",
+        r"\bproblem\b",
+        r"\bhelp\b",
     ]
 
-    research_keywords = [
-        "competitor research",
-        "market research report",
-        "market research",
-        "trend analysis",
-        "competitor analysis",
-        "market analysis",
-        "research",
+    hr_patterns = [
+        r"\bhr\b",
+        r"\bhuman\s+resources\b",
+        r"\brecruitment\b",
+        r"\bhiring\b",
+        r"\bcandidates?\b",
     ]
 
-    sales_keywords = [
-        "demo",
-        "pricing",
-        "price",
-        "plan",
-        "plans",
-        "service",
-        "services",
-        "sales",
-        "lead",
-        "leads",
-        "buy",
-        "purchase",
+    accountant_patterns = [
+        r"\baccount(?:ant|ing)\b",
+        r"\binvoices?\b",
+        r"\bgst\b",
+        r"\bexpenses?\b",
+        r"\bprofit\b",
+        r"\baccounts?\b",
     ]
 
-    if any(
-        keyword in text
-        for keyword in support_keywords
-    ):
+    research_patterns = [
+        r"\bresearch\b",
+        r"\bmarket\s+research\b",
+        r"\bcompetitor\s+research\b",
+    ]
+
+    def matches(patterns):
+        return any(
+            re.search(pattern, text)
+            for pattern in patterns
+        )
+
+    sales = matches(
+        sales_patterns
+    )
+
+    support = matches(
+        support_patterns
+    )
+
+    hr = matches(
+        hr_patterns
+    )
+
+    accountant = matches(
+        accountant_patterns
+    )
+
+    research = matches(
+        research_patterns
+    )
+
+    # Sales has priority when the customer is discussing
+    # sales/leads/demo/pricing, even if support is also mentioned.
+    if sales:
+        return "sales"
+
+    if support:
         return "support"
 
-    if any(
-        keyword in text
-        for keyword in hr_keywords
-    ):
+    if hr:
         return "hr"
 
-    if any(
-        keyword in text
-        for keyword in accountant_keywords
-    ):
+    if accountant:
         return "accountant"
 
-    if any(
-        keyword in text
-        for keyword in research_keywords
-    ):
+    if research:
         return "research"
 
-    if any(
-        keyword in text
-        for keyword in sales_keywords
+    # Current message is ambiguous.
+    # Use recent customer context as fallback.
+
+    context_text = str(
+        customer_memory or ""
+    ).lower()
+
+    for item in reversed(
+        history[-8:]
+    ):
+
+        if isinstance(item, dict):
+
+            context_text += " " + str(
+                item.get("content")
+                or item.get("message")
+                or item.get("text")
+                or ""
+            ).lower()
+
+    if re.search(
+        r"\b(?:sales|lead|demo|pricing|package)\b",
+        context_text,
     ):
         return "sales"
 
+    if re.search(
+        r"\b(?:support|complaint|customer\s+query|faq)\b",
+        context_text,
+    ):
+        return "support"
+
+    if re.search(
+        r"\b(?:hr|recruitment|hiring)\b",
+        context_text,
+    ):
+        return "hr"
+
+    if re.search(
+        r"\b(?:accountant|accounting|invoice|gst)\b",
+        context_text,
+    ):
+        return "accountant"
+
+    if re.search(
+        r"\b(?:research|competitor\s+research)\b",
+        context_text,
+    ):
+        return "research"
+
     return "sales"
+
+
 
 
 # ============================================================
@@ -2651,12 +2758,17 @@ def conversational_sales_reply(
             detected_business = business
             break
 
+    requested_agents = extract_interested_agent(
+        user_message
+    )
+
     if detected_business:
 
         if detected_business == "Real estate":
             return (
                 "Real estate mein Sales Agent kaafi useful ho sakta hai — "
-                "lead capture, qualification aur WhatsApp follow-ups automate kar sakta hai. 👍\n\n"
+                "lead capture, qualification aur WhatsApp follow-ups automate "
+                "kar sakta hai. 👍\n\n"
                 "Aap roughly kitne leads handle karte hain?"
             )
 
@@ -2673,7 +2785,8 @@ def conversational_sales_reply(
         ]:
             return (
                 f"{detected_business.title()} ke liye Support Agent aur Sales Agent "
-                "dono useful ho sakte hain — queries, follow-ups aur lead handling automate ho sakti hai. 👍\n\n"
+                "dono useful ho sakte hain — queries, follow-ups aur lead handling "
+                "automate ho sakti hai. 👍\n\n"
                 "Aapko zyada problem customer queries mein hai ya leads mein?"
             )
 
@@ -2685,11 +2798,48 @@ def conversational_sales_reply(
             "agency",
             "consulting",
         ]:
+
+            # ----------------------------------------------------
+            # MEMORY-AWARE MULTI-AGENT DETECTION
+            # ----------------------------------------------------
+
+            memory_match = None
+
+            if not requested_agents and customer_memory:
+                memory_match = re.search(
+                    r"(?im)^Interested Agent:\s*(.+)$",
+                    customer_memory,
+                )
+
+            if memory_match:
+                requested_agents = (
+                    memory_match.group(1).strip()
+                )
+
+            if requested_agents == "Sales + Support":
+                return (
+                    f"{detected_business.title()} business ke liye "
+                    "Sales + Support dono automate kiye ja sakte hain. "
+                    "Lead capture, follow-ups aur common customer queries "
+                    "WhatsApp par automate ho sakti hain. 👍\n\n"
+                    "Aapke business mein approx kitne leads ya "
+                    "customer conversations per month aate hain?"
+                )
+
             return (
                 f"{detected_business.title()} business mein WhatsApp automation "
-                "aur Sales Agent repetitive customer handling ko automate kar sakte hain. 👍\n\n"
+                "aur Sales Agent repetitive customer handling ko automate "
+                "kar sakte hain. 👍\n\n"
                 "Aapka main requirement leads hai ya customer support?"
             )
+
+    # --------------------------------------------------------
+    # GENERIC BUSINESS / AUTOMATION CONTEXT
+    # --------------------------------------------------------
+    # If the customer has not specified a business type,
+    # never call detected_business.title().
+    # Continue to the generic handling / LLM flow.
+    # --------------------------------------------------------
                 # ========================================================
     # GENERIC BUDGET CONTEXT
     # ========================================================

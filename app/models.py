@@ -465,7 +465,7 @@ class Lead(Base):
 
         ForeignKey("tenants.id"),
 
-        nullable=True,
+        nullable=False,
 
         index=True,
 

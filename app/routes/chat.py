@@ -14,6 +14,9 @@ import logging
 
 import asyncio
 
+import time
+
+
 from typing import Optional, Dict, Any, List
 
 import httpx
@@ -993,6 +996,74 @@ def parse_whatsapp_message(
         )
         return None
 # ============================================================
+# WEBHOOK RATE LIMITING
+# ============================================================
+
+WEBHOOK_RATE_LIMIT_WINDOW = 60
+WEBHOOK_RATE_LIMIT_MAX_REQUESTS = 60
+
+WEBHOOK_REQUESTS = {}
+WEBHOOK_REQUESTS_LOCK = asyncio.Lock()
+
+
+async def check_webhook_rate_limit(client_ip: str) -> bool:
+    """
+    Simple in-memory rate limiter.
+
+    Allows up to 60 webhook requests per IP
+    within a rolling 60-second window.
+    """
+
+    now = time.monotonic()
+    client_ip = str(client_ip or "unknown").strip()
+
+    async with WEBHOOK_REQUESTS_LOCK:
+
+        timestamps = WEBHOOK_REQUESTS.get(client_ip, [])
+
+        cutoff = now - WEBHOOK_RATE_LIMIT_WINDOW
+
+        timestamps = [
+            timestamp
+            for timestamp in timestamps
+            if timestamp > cutoff
+        ]
+
+        if len(timestamps) >= WEBHOOK_RATE_LIMIT_MAX_REQUESTS:
+            WEBHOOK_REQUESTS[client_ip] = timestamps
+
+            logger.warning(
+                "META webhook rate limit exceeded | ip=%s",
+                client_ip,
+            )
+
+            return False
+
+        timestamps.append(now)
+
+        WEBHOOK_REQUESTS[client_ip] = timestamps
+
+        # Prevent unlimited IP dictionary growth.
+        if len(WEBHOOK_REQUESTS) > 5000:
+            oldest_ip = min(
+                WEBHOOK_REQUESTS,
+                key=lambda ip: (
+                    WEBHOOK_REQUESTS[ip][-1]
+                    if WEBHOOK_REQUESTS[ip]
+                    else now
+                ),
+            )
+
+            if oldest_ip != client_ip:
+                WEBHOOK_REQUESTS.pop(
+                    oldest_ip,
+                    None,
+                )
+
+        return True
+
+
+# ============================================================
 
 # DUPLICATE MESSAGE PROTECTION
 
@@ -1124,7 +1195,9 @@ async def handle_customer_message(
         # 4. AGENT DETECTION
         # ====================================================
         agent_name = detect_agent(
-            user_message
+            user_message,
+            history=history,
+            customer_memory=customer_context,
         )
         # ====================================================
         # 5. LEAD EXTRACTION
@@ -1514,14 +1587,157 @@ async def verify_meta_webhook(
 # ============================================================
 
 @router.post("/webhook")
-
-
 async def meta_whatsapp_webhook(
     request: Request,
 ):
-    logger.warning(
-        "XYTRALYN META DEBUG 1 | webhook received"
+
+    # ========================================================
+    # WEBHOOK REQUEST PROTECTION
+    # ========================================================
+
+    client_ip = (
+        request.client.host
+        if request.client
+        else "unknown"
     )
+
+    # Reject obviously oversized requests before
+    # doing expensive processing.
+    content_length = request.headers.get(
+        "content-length"
+    )
+
+    MAX_WEBHOOK_BODY_SIZE = 256 * 1024  # 256 KB
+
+    if content_length:
+        try:
+            if int(content_length) > MAX_WEBHOOK_BODY_SIZE:
+                logger.warning(
+                    "META webhook rejected | "
+                    "payload too large | ip=%s | size=%s",
+                    client_ip,
+                    content_length,
+                )
+
+                return PlainTextResponse(
+                    content="PAYLOAD_TOO_LARGE",
+                    status_code=413,
+                )
+        except ValueError:
+            logger.warning(
+                "META webhook rejected | "
+                "invalid Content-Length | ip=%s",
+                client_ip,
+            )
+
+            return PlainTextResponse(
+                content="BAD_REQUEST",
+                status_code=400,
+            )
+
+    allowed = await check_webhook_rate_limit(
+        client_ip
+    )
+
+    if not allowed:
+        return PlainTextResponse(
+            content="TOO_MANY_REQUESTS",
+            status_code=429,
+        )
+
+    logger.warning(
+        "XYTRALYN META DEBUG 1 | "
+        "webhook received | ip=%s",
+        client_ip,
+    )
+
+
+    # ========================================================
+    # META WEBHOOK SIGNATURE VERIFICATION
+    # ========================================================
+    try:
+        import hashlib
+        import hmac
+        import os
+
+        raw_body = await request.body()
+
+        signature = (
+            request.headers.get(
+                "X-Hub-Signature-256",
+                "",
+            )
+            or ""
+        ).strip()
+
+        meta_app_secret = (
+            os.getenv("META_APP_SECRET")
+            or ""
+        ).strip()
+
+        # App Secret must exist in production.
+        if not meta_app_secret:
+            logger.error(
+                "META webhook rejected | "
+                "META_APP_SECRET is not configured"
+            )
+            return PlainTextResponse(
+                content="FORBIDDEN",
+                status_code=403,
+            )
+
+        # Meta sends:
+        # X-Hub-Signature-256: sha256=<hex_digest>
+        if not signature.startswith("sha256="):
+            logger.warning(
+                "META webhook rejected | "
+                "missing or invalid signature format"
+            )
+            return PlainTextResponse(
+                content="FORBIDDEN",
+                status_code=403,
+            )
+
+        received_signature = signature[
+            len("sha256="):
+        ]
+
+        expected_signature = hmac.new(
+            meta_app_secret.encode("utf-8"),
+            raw_body,
+            hashlib.sha256,
+        ).hexdigest()
+
+        if not hmac.compare_digest(
+            received_signature,
+            expected_signature,
+        ):
+            logger.warning(
+                "META webhook rejected | "
+                "signature verification failed"
+            )
+            return PlainTextResponse(
+                content="FORBIDDEN",
+                status_code=403,
+            )
+
+        logger.info(
+            "META webhook signature verified successfully."
+        )
+
+    except Exception as exc:
+        logger.exception(
+            "META webhook signature verification error: %s",
+            exc,
+        )
+        return PlainTextResponse(
+            content="FORBIDDEN",
+            status_code=403,
+        )
+
+    # ========================================================
+    # PARSE JSON
+    # ========================================================
     try:
         body = await request.json()
     except Exception as exc:
@@ -1533,6 +1749,56 @@ async def meta_whatsapp_webhook(
             content="OK",
             status_code=200,
         )
+
+        # ========================================================
+    # BASIC META PAYLOAD VALIDATION
+    # ========================================================
+
+    if not isinstance(body, dict):
+        logger.warning(
+            "META webhook rejected | "
+            "payload is not a JSON object"
+        )
+        return PlainTextResponse(
+            content="BAD_REQUEST",
+            status_code=400,
+        )
+
+    if body.get("object") != "whatsapp_business_account":
+        logger.warning(
+            "META webhook ignored | "
+            "unexpected object=%s",
+            body.get("object"),
+        )
+        return PlainTextResponse(
+            content="EVENT_RECEIVED",
+            status_code=200,
+        )
+
+    entries = body.get("entry")
+
+    if not isinstance(entries, list):
+        logger.warning(
+            "META webhook rejected | "
+            "entry is not a list"
+        )
+        return PlainTextResponse(
+            content="BAD_REQUEST",
+            status_code=400,
+        )
+
+    if not entries:
+        logger.info(
+            "META webhook ignored | empty entry"
+        )
+        return PlainTextResponse(
+            content="EVENT_RECEIVED",
+            status_code=200,
+        )
+
+    # ========================================================
+    # SAFE DIAGNOSTICS
+    # ========================================================
     # ========================================================
     # SAFE DIAGNOSTICS
     # ========================================================
@@ -1640,7 +1906,7 @@ async def meta_whatsapp_webhook(
     message_text=reply,
     tenant_id=tenant_id,
     phone_number_id=phone_number_id,
-)
+ )
     logger.warning(
         "XYTRALYN META DEBUG | send_result=%s",
         sent,
